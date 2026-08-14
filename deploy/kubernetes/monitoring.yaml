@@ -1,0 +1,148 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payment-api
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  namespaceSelector:
+    matchNames: [payments]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-api
+  endpoints:
+    - port: prom-export
+      interval: 10s
+      scrapeTimeout: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payment-financial-safety
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  groups:
+    - name: payment-financial-safety
+      interval: 10s
+      rules:
+        - alert: FinancialInvariantViolation
+          expr: increase(payments_financial_invariant_violation_total{severity="P0"}[1m]) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: A financial safety invariant was violated
+            runbook: docs/operations.md#financial-invariant-p0
+        - alert: LedgerBalanceResidual
+          expr: max(abs(payments_ledger_balance_residual_atoms)) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: A closed ledger range is not balanced
+            runbook: docs/operations.md#financial-invariant-p0
+        - alert: JournalReplayMismatch
+          expr: max(abs(payments_journal_replay_delta_atoms)) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Materialized balance differs from journal replay at the same watermark
+            runbook: docs/operations.md#financial-invariant-p0
+        - alert: EscrowConservationViolation
+          expr: max(abs(payments_escrow_conservation_delta_atoms)) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Regional spending authority is not conserved
+            runbook: docs/operations.md#financial-invariant-p0
+        - alert: LedgerSequenceGap
+          expr: max(payments_sequence_gap) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Ledger sequence is missing below a declared watermark
+            runbook: docs/operations.md#replication-lag-or-data-loss
+        - alert: CashbackRuleViolation
+          expr: increase(payments_cashback_rule_violation_total[1m]) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: A proposed or committed cashback exceeds the pinned rule
+            runbook: docs/operations.md#cashback-incident
+    - name: payment-recovery-capacity
+      interval: 30s
+      rules:
+        - alert: OutboxLagHigh
+          expr: max(payments_outbox_lag_seconds) > 60
+          for: 5m
+          labels: {severity: ticket, class: delivery}
+          annotations:
+            summary: Transactional outbox is more than one minute behind
+        - alert: ReconciliationLagHigh
+          expr: max(payments_reconciliation_lag_seconds) > 900
+          for: 15m
+          labels: {severity: ticket, class: reconciliation}
+          annotations:
+            summary: Reconciliation is more than fifteen minutes behind
+        - alert: ExternalOutcomeUnknownTooLong
+          expr: sum(payments_unknown_external_effects) > 0
+          for: 15m
+          labels: {severity: ticket, class: reconciliation}
+          annotations:
+            summary: External rail effects remain UNKNOWN
+        - alert: MetricsAbsent
+          expr: absent(up{job=~".*payment-api.*"} == 1)
+          for: 2m
+          labels: {severity: page, class: observability}
+          annotations:
+            summary: Payment financial metrics are absent; invariant status is unknown
+        - alert: ReconciliationUnsafe
+          expr: payments_reconciliation_latest_safe != 1
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Latest durable reconciliation report contains a P0 finding
+            runbook: docs/operations.md#financial-invariant-p0
+        - alert: ReconciliationStalled
+          expr: absent(payments_reconciliation_runs_total) or sum(increase(payments_reconciliation_runs_total[30m])) < 1
+          for: 5m
+          labels: {severity: page, class: observability}
+          annotations:
+            summary: No durable reconciliation report completed in the expected window
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: outbox-publisher
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  namespaceSelector:
+    matchNames: [payments]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: outbox-publisher
+  endpoints:
+    - port: prom-export
+      interval: 10s
+      scrapeTimeout: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: reconciliation-worker
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  namespaceSelector:
+    matchNames: [payments]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reconciliation-worker
+  endpoints:
+    - port: prom-export
+      interval: 30s
+      scrapeTimeout: 5s

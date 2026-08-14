@@ -1,0 +1,209 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: payment-api-server
+  namespace: payments
+spec:
+  secretName: payment-api-server-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+  dnsNames:
+    - payment-api
+    - payment-api.payments
+    - payment-api.payments.svc
+    - payment-api.payments.svc.cluster.local
+  uris:
+    - spiffe://payments.example/service/payment-api
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: payment-api-cockroach-client
+  namespace: payments
+spec:
+  secretName: payment-api-cockroach-client-tls
+  duration: 24h
+  renewBefore: 8h
+  commonName: payment_api
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+# The login user is separate from the NOLOGIN capability role. Bootstrap grants
+# reference_migration_operator to reference_migration; the cert CN authenticates
+# the login without a database password.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: reference-migration-cockroach-client
+  namespace: payments
+spec:
+  secretName: reference-migration-cockroach-client-tls
+  duration: 1h
+  renewBefore: 20m
+  commonName: reference_migration
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+# cainjector populates data.ca.crt from the workload issuer certificate chain.
+# The API uses it to require and verify client mTLS certificates with SPIFFE SANs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-workload-client-ca
+  namespace: payments
+  annotations:
+    cert-manager.io/inject-ca-from: payments/payment-api-server
+data: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cockroach-public-ca
+  namespace: payments
+  annotations:
+    cert-manager.io/inject-ca-from: payments/payment-api-cockroach-client
+data: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: payment-api-otel-client
+  namespace: payments
+spec:
+  secretName: otel-client-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  uris:
+    - spiffe://payments.example/service/payment-api-telemetry
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: outbox-publisher-cockroach-client
+  namespace: payments
+spec:
+  secretName: outbox-publisher-cockroach-client-tls
+  duration: 24h
+  renewBefore: 8h
+  commonName: outbox_publisher
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: outbox-publisher-otel-client
+  namespace: payments
+spec:
+  secretName: outbox-publisher-otel-client-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  uris:
+    - spiffe://payments.example/service/outbox-publisher-telemetry
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer
+---
+# Short-lived privileged certificate used only by the controlled migration Job.
+# Vault policy restricts issuance of CN=root to the schema-migrator identity.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: schema-migrator-cockroach-client
+  namespace: payments
+spec:
+  secretName: schema-migrator-cockroach-client-tls
+  duration: 1h
+  renewBefore: 20m
+  commonName: root
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: reconciliation-worker-cockroach-client
+  namespace: payments
+spec:
+  secretName: reconciliation-worker-cockroach-client-tls
+  duration: 24h
+  renewBefore: 8h
+  commonName: reconciliation_worker
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: reconciliation-worker-otel-client
+  namespace: payments
+spec:
+  secretName: reconciliation-worker-otel-client-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  uris:
+    - spiffe://payments.example/service/reconciliation-worker-telemetry
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer

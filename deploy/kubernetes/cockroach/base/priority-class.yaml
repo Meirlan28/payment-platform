@@ -1,0 +1,9 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: payment-financial-stateful
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: Correctness-critical payment stateful workloads.
+

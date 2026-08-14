@@ -1,0 +1,26 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-kafka-controllers
+  namespace: payments
+spec:
+  minAvailable: 4
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  selector:
+    matchLabels:
+      strimzi.io/cluster: payments-kafka
+      strimzi.io/pool-name: controllers
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-kafka-brokers
+  namespace: payments
+spec:
+  minAvailable: 9
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  selector:
+    matchLabels:
+      strimzi.io/cluster: payments-kafka
+      strimzi.io/pool-name: brokers
+

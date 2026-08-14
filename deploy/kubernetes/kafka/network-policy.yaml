@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-kafka
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      strimzi.io/cluster: payments-kafka
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [outbox, consumer, saga, reconciliation]
+      ports:
+        - {port: 9093, protocol: TCP}
+        - {port: 9094, protocol: TCP}
+    - from:
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: payments-kafka
+      ports:
+        - {port: 9090, protocol: TCP}
+        - {port: 9091, protocol: TCP}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    - to:
+        - podSelector:
+            matchLabels:
+              strimzi.io/cluster: payments-kafka
+      ports:
+        - {port: 9090, protocol: TCP}
+        - {port: 9091, protocol: TCP}
+        - {port: 9093, protocol: TCP}
+        - {port: 9094, protocol: TCP}
+

@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package events.v1;
+
+option go_package = "github.com/example/payment-platform/gen/go/events/v1;eventsv1";
+
+message EventEnvelope {
+  string event_id = 1;
+  string aggregate_id = 2;
+  uint64 aggregate_version = 3;
+  string event_type = 4;
+  bytes payload = 5;
+  string causation_id = 6;
+  string correlation_id = 7;
+  string schema_version = 8;
+}
+

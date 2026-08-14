@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-gateway
+  namespace: observability
+  annotations:
+    payment.example/workload-identity: otel-gateway
+automountServiceAccountToken: false
+---
+# This ClusterIssuer is a platform prerequisite backed by Vault PKI. No private
+# key or Vault token is represented in this repository.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: otel-gateway-server
+  namespace: observability
+spec:
+  secretName: otel-gateway-server-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [server auth]
+  dnsNames:
+    - otel-gateway
+    - otel-gateway.observability
+    - otel-gateway.observability.svc
+    - otel-gateway.observability.svc.cluster.local
+  uris:
+    - spiffe://payments.example/service/otel-gateway
+  issuerRef:
+    name: workload-vault-pki
+    kind: ClusterIssuer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-client-ca
+  namespace: observability
+  annotations:
+    cert-manager.io/inject-ca-from: observability/otel-gateway-server
+data: {}
+

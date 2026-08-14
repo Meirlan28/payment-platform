@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cockroachdb
+  namespace: payments
+  annotations:
+    payment.example/workload-identity: cockroachdb
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cockroachdb
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: cockroachdb
+    app.kubernetes.io/component: ledger-storage
+spec:
+  serviceName: cockroachdb
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cockroachdb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cockroachdb
+        app.kubernetes.io/component: ledger-storage
+    spec:
+      serviceAccountName: cockroachdb
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      priorityClassName: payment-financial-stateful
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      nodeSelector:
+        payment.example/workload: financial-stateful
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: cockroachdb
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cockroachdb
+      containers:
+        - name: cockroachdb
+          image: registry.invalid/cockroachdb/cockroach:v26.2.0-replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          command: ["/cockroach/cockroach"]
+          args:
+            - start
+            - --certs-dir=/cockroach/certs
+            - --listen-addr=0.0.0.0:26357
+            - --sql-addr=0.0.0.0:26257
+            - --http-addr=0.0.0.0:8080
+            - --advertise-addr=$(POD_NAME).$(ADVERTISE_SUFFIX):26357
+            - --join=$(JOIN_ADDRESSES)
+            - --locality=region=$(REGION_ID),dc=$(DC_ID)
+            - --attrs=ledger
+            - --store=path=/cockroach/data,size=90%
+            - --cache=25%
+            - --max-sql-memory=25%
+          envFrom:
+            - configMapRef: {name: cockroach-site}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: COCKROACH_CHANNEL
+              value: regular
+          ports:
+            - {name: sql, containerPort: 26257}
+            - {name: rpc, containerPort: 26357}
+            - {name: admin, containerPort: 8080}
+          startupProbe:
+            tcpSocket: {port: rpc}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 120
+          readinessProbe:
+            tcpSocket: {port: sql}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: {port: rpc}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/cockroach/cockroach", "node", "drain", "--self", "--certs-dir=/cockroach/certs", "--host=127.0.0.1:26257", "--drain-wait=30s"]
+          resources:
+            requests: {cpu: "4", memory: 16Gi, ephemeral-storage: 2Gi}
+            limits: {cpu: "8", memory: 32Gi, ephemeral-storage: 8Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: data, mountPath: /cockroach/data}
+            - {name: node-tls, mountPath: /cockroach/certs, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: node-tls
+          csi:
+            driver: csi.cert-manager.io
+            readOnly: true
+            volumeAttributes:
+              csi.cert-manager.io/issuer-name: cockroach-node-vault-pki
+              csi.cert-manager.io/issuer-kind: Issuer
+              csi.cert-manager.io/common-name: node
+              csi.cert-manager.io/dns-names: ${POD_NAME}.cockroachdb.payments.svc.cluster.local,*.cockroach.dc-00.payments.internal,cockroach.dc-00.payments.internal,cockroach-public.payments.svc.cluster.local
+              csi.cert-manager.io/key-usages: server auth,client auth
+              csi.cert-manager.io/certificate-file: node.crt
+              csi.cert-manager.io/privatekey-file: node.key
+              csi.cert-manager.io/ca-file: ca.crt
+              csi.cert-manager.io/duration: 24h
+              csi.cert-manager.io/renew-before: 8h
+              csi.cert-manager.io/fs-group: "1000"
+        - name: tmp
+          emptyDir: {sizeLimit: 2Gi}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: encrypted-local-ssd-retained
+        resources:
+          requests: {storage: 2Ti}

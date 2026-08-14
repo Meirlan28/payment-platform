@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reconciliation-worker
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: reconciliation-worker
+    app.kubernetes.io/component: financial-control
+spec:
+  # This is a deep consistent-snapshot control, not part of authorization's
+  # latency path. One active worker avoids duplicate full scans; Kubernetes
+  # restarts it and the stale-run alert pages if progress stops.
+  replicas: 1
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reconciliation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reconciliation-worker
+        app.kubernetes.io/component: financial-control
+    spec:
+      serviceAccountName: reconciliation-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: reconciliation-worker
+          image: registry.invalid/payment-platform/reconciliation-worker:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: ENVIRONMENT, value: production}
+            - {name: REGION_ID, value: pay-a}
+            - {name: ID_ISSUER, value: reconciliation-pay-a}
+            - {name: METRICS_ADDRESS, value: "127.0.0.1:9090"}
+            - {name: RECONCILIATION_INTERVAL, value: "15m"}
+            - {name: RECONCILIATION_TIMEOUT, value: "20m"}
+            - {name: DB_MAX_CONNECTIONS, value: "16"}
+            - name: DATABASE_URL
+              value: >-
+                postgresql://reconciliation_worker@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+          resources:
+            requests: {cpu: "2", memory: 2Gi, ephemeral-storage: 256Mi}
+            limits: {cpu: "8", memory: 8Gi, ephemeral-storage: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: cockroach-client, mountPath: /var/run/cockroach/client, readOnly: true}
+            - {name: cockroach-ca, mountPath: /var/run/cockroach/ca, readOnly: true}
+        - name: otel-collector
+          image: registry.invalid/open-telemetry/opentelemetry-collector-contrib:0.135.0-replace-with-signed-digest
+          args: ["--config=/etc/otel/config.yaml"]
+          ports:
+            - {name: prom-export, containerPort: 8889}
+            - {name: otel-health, containerPort: 13133}
+          startupProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: otel-config, mountPath: /etc/otel, readOnly: true}
+            - {name: otel-client, mountPath: /var/run/otel/client, readOnly: true}
+        - name: local-http-prober
+          image: registry.invalid/payment-platform/local-http-prober:replace-with-signed-digest
+          args: ["idle"]
+          startupProbe:
+            exec:
+              command: [/local-http-prober, check, --url=http://127.0.0.1:9090/ready, --timeout=250ms]
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 240
+          readinessProbe:
+            exec:
+              command: [/local-http-prober, check, --url=http://127.0.0.1:9090/ready, --timeout=250ms]
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            exec:
+              command: [/local-http-prober, check, --url=http://127.0.0.1:9090/live, --timeout=250ms]
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: cockroach-client
+          secret: {secretName: reconciliation-worker-cockroach-client-tls, defaultMode: 0400}
+        - name: cockroach-ca
+          configMap: {name: cockroach-public-ca}
+        - name: otel-config
+          configMap: {name: otel-payment-api-sidecar}
+        - name: otel-client
+          secret: {secretName: reconciliation-worker-otel-client-tls, defaultMode: 0400}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reconciliation-worker
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: reconciliation-worker
+spec:
+  selector:
+    app.kubernetes.io/name: reconciliation-worker
+  ports:
+    - {name: prom-export, port: 8889, targetPort: prom-export}

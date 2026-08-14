@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payments
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - config.yaml
+  - vault-issuers.yaml
+  - certificates.yaml
+  - payment-api.yaml
+  - outbox-publisher.yaml
+  - reconciliation-worker.yaml
+  - disruption-budgets.yaml
+  - network-policies.yaml
+  - monitoring.yaml
+commonLabels:
+  app.kubernetes.io/part-of: payment-platform

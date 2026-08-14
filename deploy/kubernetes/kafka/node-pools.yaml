@@ -1,0 +1,88 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: controllers
+  namespace: payments
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  replicas: 7
+  roles: [controller]
+  storage:
+    type: persistent-claim
+    size: 200Gi
+    class: encrypted-local-ssd-retained
+    deleteClaim: false
+  resources:
+    requests: {cpu: "2", memory: 8Gi}
+    limits: {cpu: "4", memory: 12Gi}
+  jvmOptions:
+    -Xms: 4g
+    -Xmx: 4g
+  template:
+    pod:
+      metadata:
+        labels:
+          payment.example/workload: kafka-controller
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: controllers
+              topologyKey: payment.example/dc
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: payment.example/dc
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              strimzi.io/pool-name: controllers
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: brokers
+  namespace: payments
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  replicas: 12
+  roles: [broker]
+  storage:
+    type: persistent-claim
+    size: 4Ti
+    class: encrypted-local-ssd-retained
+    deleteClaim: false
+  resources:
+    requests: {cpu: "8", memory: 32Gi}
+    limits: {cpu: "16", memory: 48Gi}
+  jvmOptions:
+    -Xms: 16g
+    -Xmx: 16g
+  template:
+    pod:
+      metadata:
+        labels:
+          payment.example/workload: kafka-broker
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  strimzi.io/pool-name: brokers
+              topologyKey: payment.example/dc
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: payment.example/dc
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              strimzi.io/pool-name: brokers
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+

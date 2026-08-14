@@ -1,0 +1,68 @@
+# Intentionally excluded from the default kustomization. Run after migrations
+# with the short-lived root certificate and two-person change approval. It
+# creates certificate-authenticated LOGIN users; no password is generated or
+# stored in Git.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: database-identities-bootstrap-release-id
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: database-identities-bootstrap
+    app.kubernetes.io/component: security-bootstrap
+  annotations:
+    payment.example/change-ticket: replace-with-approved-ticket
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database-identities-bootstrap
+        app.kubernetes.io/component: security-bootstrap
+    spec:
+      serviceAccountName: schema-migrator
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cockroach-sql
+          image: registry.invalid/cockroachdb/cockroach:v26.2.0-replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          command: ["/cockroach/cockroach"]
+          args:
+            - sql
+            - --url=postgresql://root@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+            - --set=errexit=true
+            - >-
+              --execute=CREATE USER IF NOT EXISTS payment_api;
+              GRANT ledger_writer, id_allocator, payment_authorizer TO payment_api;
+              CREATE USER IF NOT EXISTS outbox_publisher;
+              GRANT outbox_publisher_runtime TO outbox_publisher;
+              CREATE USER IF NOT EXISTS reference_migration;
+              GRANT reference_migration_operator TO reference_migration;
+              CREATE USER IF NOT EXISTS reconciliation_worker;
+              GRANT reconciliation_runtime, id_allocator TO reconciliation_worker;
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: cockroach-client, mountPath: /var/run/cockroach/client, readOnly: true}
+            - {name: cockroach-ca, mountPath: /var/run/cockroach/ca, readOnly: true}
+      volumes:
+        - name: cockroach-client
+          secret: {secretName: schema-migrator-cockroach-client-tls, defaultMode: 0400}
+        - name: cockroach-ca
+          configMap: {name: cockroach-public-ca}

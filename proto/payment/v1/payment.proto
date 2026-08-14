@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package payment.v1;
+
+option go_package = "github.com/example/payment-platform/gen/go/payment/v1;paymentv1";
+
+service PaymentService {
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
+  rpc Capture(CaptureRequest) returns (CaptureResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  rpc Reversal(ReversalRequest) returns (ReversalResponse);
+  rpc Refund(RefundRequest) returns (RefundResponse);
+  rpc Chargeback(ChargebackRequest) returns (ChargebackResponse);
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+}
+
+message Money {
+  string asset_id = 1;
+  // Canonical base-10 integer string. This preserves DECIMAL(38,0) values in
+  // every language and avoids JSON/protobuf int64 truncation.
+  string atoms = 2;
+}
+
+message AuthorizeRequest {
+  string idempotency_key = 1;
+  string payer_account_id = 2;
+  string merchant_account_id = 3;
+  Money amount = 4;
+  string authority_region = 5;
+  string book_id = 6;
+  string payer_held_account_id = 7;
+  Money cashback_rule_maximum = 8;
+  string posting_rule_version = 9;
+}
+
+message CaptureRequest {
+  string idempotency_key = 1;
+  string payment_id = 2;
+  Money amount = 3;
+  string book_id = 4;
+  Money fee = 5;
+  Money tax = 6;
+  Money cashback = 7;
+  string fee_account_id = 8;
+  string tax_account_id = 9;
+  string cashback_expense_account_id = 10;
+  string posting_rule_version = 11;
+}
+
+message RefundRequest {
+  string idempotency_key = 1;
+  string payment_id = 2;
+  Money amount = 3;
+  string book_id = 4;
+  string original_capture_transaction_id = 5;
+  string merchant_debit_account_id = 6;
+  string posting_rule_version = 7;
+}
+
+message ReleaseRequest {
+  string idempotency_key = 1;
+  string payment_id = 2;
+  Money amount = 3;
+  string book_id = 4;
+  string posting_rule_version = 5;
+}
+
+message ReversalRequest {
+  string idempotency_key = 1;
+  string payment_id = 2;
+  Money amount = 3;
+  string book_id = 4;
+  string posting_rule_version = 5;
+}
+
+message ChargebackRequest {
+  string idempotency_key = 1;
+  string payment_id = 2;
+  Money amount = 3;
+  string book_id = 4;
+  string original_capture_transaction_id = 5;
+  string merchant_reserve_account_id = 6;
+  string posting_rule_version = 7;
+}
+
+message GetPaymentRequest {
+  string payment_id = 1;
+}
+
+message Payment {
+  string payment_id = 1;
+  string state = 2;
+  string transaction_id = 3;
+  string durable_receipt_hash = 4;
+  string amount_atoms = 5;
+  int64 version = 6;
+  bool idempotent_replay = 7;
+}
+
+message AuthorizeResponse {
+  Payment payment = 1;
+}
+
+message CaptureResponse {
+  Payment payment = 1;
+}
+
+message ReleaseResponse {
+  Payment payment = 1;
+}
+
+message ReversalResponse {
+  Payment payment = 1;
+}
+
+message RefundResponse {
+  Payment payment = 1;
+}
+
+message ChargebackResponse {
+  Payment payment = 1;
+}
+
+message GetPaymentResponse {
+  Payment payment = 1;
+}

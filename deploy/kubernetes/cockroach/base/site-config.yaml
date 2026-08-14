@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cockroach-site
+  namespace: payments
+data:
+  DC_ID: dc-00
+  REGION_ID: global
+  ADVERTISE_SUFFIX: cockroach.dc-00.payments.internal
+  JOIN_ADDRESSES: >-
+    cockroach.dc-01.payments.internal:26357,cockroach.dc-02.payments.internal:26357,cockroach.dc-03.payments.internal:26357,cockroach.dc-04.payments.internal:26357,cockroach.dc-05.payments.internal:26357,cockroach.dc-06.payments.internal:26357,cockroach.dc-07.payments.internal:26357,cockroach.dc-08.payments.internal:26357,cockroach.dc-09.payments.internal:26357,cockroach.dc-10.payments.internal:26357,cockroach.dc-11.payments.internal:26357,cockroach.dc-12.payments.internal:26357
+

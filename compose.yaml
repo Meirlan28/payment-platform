@@ -1,0 +1,253 @@
+name: payment-platform
+
+# This topology is for repeatable integration and chaos testing. It uses the
+# same database and broker products as production, but production credentials,
+# TLS, anti-affinity and 7-voter placement live under deploy/kubernetes.
+x-cockroach: &cockroach
+  image: cockroachdb/cockroach:v26.2.0
+  restart: unless-stopped
+  environment:
+    COCKROACH_ACCEPT_LICENSE: "yes"
+  networks: [payments]
+
+x-kafka: &kafka
+  image: apache/kafka:4.3.1
+  restart: unless-stopped
+  networks: [payments]
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+services:
+  cockroach-1:
+    <<: *cockroach
+    hostname: cockroach-1
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=cockroach-1:26357
+      - --listen-addr=cockroach-1:26357
+      - --sql-addr=cockroach-1:26257
+      - --http-addr=cockroach-1:8080
+      - --join=cockroach-1:26357,cockroach-2:26357,cockroach-3:26357
+      - --locality=region=test-a,zone=a1
+      - --store=/cockroach/cockroach-data
+    volumes: [cockroach-1:/cockroach/cockroach-data]
+    ports: ["26257:26257", "8080:8080"]
+    healthcheck:
+      test: ["CMD", "cockroach", "node", "status", "--insecure", "--host=cockroach-1:26257"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  cockroach-2:
+    <<: *cockroach
+    hostname: cockroach-2
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=cockroach-2:26357
+      - --listen-addr=cockroach-2:26357
+      - --sql-addr=cockroach-2:26257
+      - --http-addr=cockroach-2:8080
+      - --join=cockroach-1:26357,cockroach-2:26357,cockroach-3:26357
+      - --locality=region=test-b,zone=b1
+      - --store=/cockroach/cockroach-data
+    volumes: [cockroach-2:/cockroach/cockroach-data]
+    healthcheck:
+      test: ["CMD", "cockroach", "node", "status", "--insecure", "--host=cockroach-2:26257"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  cockroach-3:
+    <<: *cockroach
+    hostname: cockroach-3
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=cockroach-3:26357
+      - --listen-addr=cockroach-3:26357
+      - --sql-addr=cockroach-3:26257
+      - --http-addr=cockroach-3:8080
+      - --join=cockroach-1:26357,cockroach-2:26357,cockroach-3:26357
+      - --locality=region=test-c,zone=c1
+      - --store=/cockroach/cockroach-data
+    volumes: [cockroach-3:/cockroach/cockroach-data]
+    healthcheck:
+      test: ["CMD", "cockroach", "node", "status", "--insecure", "--host=cockroach-3:26257"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  cockroach-init:
+    <<: *cockroach
+    restart: "no"
+    depends_on:
+      cockroach-1: {condition: service_started}
+      cockroach-2: {condition: service_started}
+      cockroach-3: {condition: service_started}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        cockroach init --insecure --host=cockroach-1:26357 || true;
+        until cockroach sql --insecure --host=cockroach-1:26257 -e 'SELECT 1'; do sleep 1; done;
+        cockroach sql --insecure --host=cockroach-1:26257
+        -e 'CREATE DATABASE IF NOT EXISTS payment_platform'
+
+  kafka-1:
+    <<: *kafka
+    hostname: kafka-1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+    volumes: [kafka-1:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  kafka-2:
+    <<: *kafka
+    hostname: kafka-2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes: [kafka-2:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  kafka-3:
+    <<: *kafka
+    hostname: kafka-3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes: [kafka-3:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  migrator:
+    build:
+      context: .
+      target: migrator
+    restart: "no"
+    depends_on:
+      cockroach-init: {condition: service_completed_successfully}
+    environment:
+      DATABASE_URL: postgresql://root@cockroach-1:26257/payment_platform?sslmode=disable
+    networks: [payments]
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    restart: "no"
+    depends_on:
+      kafka-1: {condition: service_healthy}
+      kafka-2: {condition: service_healthy}
+      kafka-3: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092
+        --create --if-not-exists --topic payment-events --partitions 24 --replication-factor 3
+        --config min.insync.replicas=2;
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092
+        --create --if-not-exists --topic payment-events-dlq --partitions 6 --replication-factor 3
+        --config min.insync.replicas=2
+    networks: [payments]
+
+  outbox-publisher:
+    profiles: [application]
+    build:
+      context: .
+      target: publisher
+    restart: unless-stopped
+    depends_on:
+      migrator: {condition: service_completed_successfully}
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      ENVIRONMENT: integration
+      REGION_ID: test-a
+      PUBLISHER_OWNER: compose-publisher-test-a
+      DATABASE_URL: postgresql://root@cockroach-1:26257/payment_platform?sslmode=disable
+      KAFKA_BROKERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      KAFKA_CLIENT_ID: outbox-publisher-test-a
+      METRICS_ADDRESS: 127.0.0.1:9090
+    networks: [payments]
+
+  reconciliation-worker:
+    profiles: [application]
+    build:
+      context: .
+      target: reconciliation
+    restart: unless-stopped
+    depends_on:
+      migrator: {condition: service_completed_successfully}
+    environment:
+      ENVIRONMENT: integration
+      REGION_ID: test-a
+      ID_ISSUER: reconciliation-test-a
+      DATABASE_URL: postgresql://root@cockroach-1:26257/payment_platform?sslmode=disable
+      METRICS_ADDRESS: 127.0.0.1:9090
+      RECONCILIATION_INTERVAL: 1m
+      RECONCILIATION_TIMEOUT: 2m
+    networks: [payments]
+
+  go-toolchain:
+    image: golang:1.26.5-bookworm
+    working_dir: /src
+    volumes:
+      - .:/src:z
+      - go-mod-cache:/go/pkg/mod
+      - go-build-cache:/root/.cache/go-build
+    environment:
+      DATABASE_URL: postgresql://root@cockroach-1:26257/payment_platform?sslmode=disable
+      KAFKA_BROKERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+    networks: [payments]
+
+  buf:
+    image: bufbuild/buf:1.69.0
+    working_dir: /src
+    volumes: [".:/src:z"]
+
+  generate:
+    image: bufbuild/buf:1.69.0
+    working_dir: /src
+    volumes: [".:/src:z"]
+    entrypoint: ["buf", "generate"]
+
+networks:
+  payments: {}
+
+volumes:
+  cockroach-1: {}
+  cockroach-2: {}
+  cockroach-3: {}
+  kafka-1: {}
+  kafka-2: {}
+  kafka-3: {}
+  go-mod-cache: {}
+  go-build-cache: {}

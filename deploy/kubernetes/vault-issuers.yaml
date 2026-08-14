@@ -1,0 +1,41 @@
+# cert-manager authenticates to Vault with a projected Kubernetes service-account
+# token. The Vault CA ConfigMap is provisioned by the platform trust bootstrap;
+# no root key or token is stored in Git.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: workload-vault-pki
+  namespace: payments
+spec:
+  vault:
+    server: https://vault-active.vault.svc.cluster.local:8200
+    path: pki_workloads/sign/payment-platform
+    caBundleSecretRef:
+      name: vault-public-ca
+      key: ca.crt
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: cert-manager-payment-platform
+        serviceAccountRef:
+          name: payment-cert-issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cockroach-client-vault-pki
+  namespace: payments
+spec:
+  vault:
+    server: https://vault-active.vault.svc.cluster.local:8200
+    path: pki_cockroach/sign/client
+    caBundleSecretRef:
+      name: vault-public-ca
+      key: ca.crt
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: cert-manager-cockroach-client
+        serviceAccountRef:
+          name: payment-cert-issuer
+

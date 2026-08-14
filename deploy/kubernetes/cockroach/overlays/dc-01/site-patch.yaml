@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: cockroach-site, namespace: payments}
+data:
+  DC_ID: dc-01
+  REGION_ID: americas
+  ADVERTISE_SUFFIX: cockroach.dc-01.payments.internal
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: cockroachdb, namespace: payments}
+spec:
+  template:
+    spec:
+      volumes:
+        - name: node-tls
+          csi:
+            volumeAttributes:
+              csi.cert-manager.io/dns-names: ${POD_NAME}.cockroachdb.payments.svc.cluster.local,*.cockroach.dc-01.payments.internal,cockroach.dc-01.payments.internal,cockroach-public.payments.svc.cluster.local
+

@@ -1,0 +1,226 @@
+global:
+  enabled: true
+  tlsDisable: false
+
+injector:
+  enabled: false
+
+csi:
+  enabled: false
+
+server:
+  # The release pipeline replaces this with the signed digest of a custom image
+  # based on Vault Enterprise 1.21.4-ent plus the approved PKCS#11 library.
+  image:
+    repository: registry.invalid/payment-platform/vault-enterprise-hsm
+    tag: 1.21.4-ent-replace-with-signed-digest
+    pullPolicy: IfNotPresent
+
+  updateStrategyType: OnDelete
+  priorityClassName: payment-financial-stateful
+  logLevel: info
+  logFormat: json
+
+  serviceAccount:
+    create: true
+    name: vault
+    annotations:
+      payment.example/workload-identity: vault-server
+
+  extraEnvironmentVars:
+    VAULT_CACERT: /vault/userconfig/vault-server-tls/ca.crt
+    VAULT_SEAL_TYPE: pkcs11
+    VAULT_HSM_LIB: /usr/local/lib/pkcs11/vendor-pkcs11.so
+    VAULT_HSM_SLOT: "0"
+    VAULT_HSM_KEY_LABEL: payment-vault-seal
+    VAULT_HSM_HMAC_KEY_LABEL: payment-vault-seal-hmac
+    VAULT_HSM_GENERATE_KEY: "false"
+    VAULT_HSM_MECHANISM: "0x1087"
+    HOME: /home/vault
+
+  extraSecretEnvironmentVars:
+    - envName: VAULT_HSM_PIN
+      secretName: vault-hsm-runtime
+      secretKey: pin
+    - envName: VAULT_LICENSE
+      secretName: vault-enterprise-license
+      secretKey: license
+
+  volumes:
+    - name: vault-server-tls
+      secret:
+        secretName: vault-server-tls
+        defaultMode: 0400
+    - name: vault-home
+      emptyDir:
+        sizeLimit: 256Mi
+    - name: vault-tmp
+      emptyDir:
+        sizeLimit: 1Gi
+  volumeMounts:
+    - name: vault-server-tls
+      mountPath: /vault/userconfig/vault-server-tls
+      readOnly: true
+    - name: vault-home
+      mountPath: /home/vault
+    - name: vault-tmp
+      mountPath: /tmp
+
+  resources:
+    requests: {cpu: "2", memory: 8Gi, ephemeral-storage: 1Gi}
+    limits: {cpu: "8", memory: 16Gi, ephemeral-storage: 4Gi}
+
+  dataStorage:
+    enabled: true
+    size: 500Gi
+    storageClass: encrypted-local-ssd-retained
+    accessMode: ReadWriteOnce
+  auditStorage:
+    enabled: true
+    size: 500Gi
+    storageClass: encrypted-local-ssd-retained
+    accessMode: ReadWriteOnce
+
+  readinessProbe:
+    enabled: true
+    path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+    port: 8200
+    scheme: HTTPS
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  livenessProbe:
+    enabled: true
+    path: /v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204
+    port: 8200
+    scheme: HTTPS
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: vault
+              component: server
+          topologyKey: payment.example/dc
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: payment.example/dc
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: vault
+          component: server
+
+  statefulSet:
+    securityContext:
+      pod:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      container:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+
+  disruptionBudget:
+    enabled: true
+    maxUnavailable: 3
+
+  standalone:
+    enabled: false
+  ha:
+    enabled: true
+    replicas: 7
+    apiAddr: https://$(POD_IP):8200
+    clusterAddr: https://$(HOSTNAME).vault-internal:8201
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = false
+        disable_mlock = true
+        cluster_name = "payment-platform-vault"
+
+        listener "tcp" {
+          address                  = "[::]:8200"
+          cluster_address          = "[::]:8201"
+          tls_disable              = 0
+          tls_cert_file            = "/vault/userconfig/vault-server-tls/tls.crt"
+          tls_key_file             = "/vault/userconfig/vault-server-tls/tls.key"
+          tls_client_ca_file       = "/vault/userconfig/vault-server-tls/ca.crt"
+          tls_min_version          = "tls13"
+          telemetry {
+            unauthenticated_metrics_access = false
+          }
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+          retry_join {
+            leader_api_addr = "https://vault-0.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-1.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-2.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-3.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-4.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-5.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+          retry_join {
+            leader_api_addr = "https://vault-6.vault-internal:8200"
+            leader_tls_servername = "vault-active.vault.svc.cluster.local"
+            leader_ca_cert_file = "/vault/userconfig/vault-server-tls/ca.crt"
+            leader_client_cert_file = "/vault/userconfig/vault-server-tls/tls.crt"
+            leader_client_key_file = "/vault/userconfig/vault-server-tls/tls.key"
+          }
+        }
+
+        service_registration "kubernetes" {}
+        telemetry {
+          prometheus_retention_time = "24h"
+          disable_hostname = true
+        }
+
+ui:
+  enabled: false

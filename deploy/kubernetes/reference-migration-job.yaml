@@ -1,0 +1,79 @@
+# Intentionally excluded from the default kustomization. The release pipeline
+# renders one immutable Job per reviewed phase/state-version transition. The
+# placeholder action is invalid and therefore fails closed if this template is
+# applied without rendering.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reference-migration-release-id-phase
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: reference-migration
+    app.kubernetes.io/component: schema-transition
+  annotations:
+    payment.example/change-ticket: replace-with-approved-ticket
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reference-migration
+        app.kubernetes.io/component: schema-transition
+    spec:
+      serviceAccountName: reference-migration
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reference-migration
+          image: registry.invalid/payment-platform/reference-migration:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --action=replace-with-reviewed-action
+            - --generation=0
+            - --expected-version=-1
+            - --batch-size=1000
+            - --max-batches=0
+            - --consumer=replace-with-reviewed-consumer
+            - --required=true
+          env:
+            - name: DATABASE_URL
+              value: >-
+                postgresql://reference_migration@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+              ephemeral-storage: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cockroach-client
+              mountPath: /var/run/cockroach/client
+              readOnly: true
+            - name: cockroach-ca
+              mountPath: /var/run/cockroach/ca
+              readOnly: true
+      volumes:
+        - name: cockroach-client
+          secret:
+            secretName: reference-migration-cockroach-client-tls
+            defaultMode: 0400
+        - name: cockroach-ca
+          configMap:
+            name: cockroach-public-ca

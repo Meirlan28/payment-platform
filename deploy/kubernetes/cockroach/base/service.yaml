@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: cockroachdb
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: cockroachdb
+  ports:
+    - {name: sql, port: 26257, targetPort: sql}
+    - {name: rpc, port: 26357, targetPort: rpc}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroach-public
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: cockroachdb
+spec:
+  selector:
+    app.kubernetes.io/name: cockroachdb
+  ports:
+    - {name: sql, port: 26257, targetPort: sql}
+---
+# The platform multi-cluster service/DNS controller exports the site endpoint.
+# RPC remains on private routed networks; it must never receive a public IP.
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: cockroachdb
+  namespace: payments
+

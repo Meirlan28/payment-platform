@@ -1,0 +1,58 @@
+groups:
+  - name: payment-financial-safety
+    interval: 10s
+    rules:
+      - alert: FinancialInvariantViolation
+        expr: increase(payments_financial_invariant_violation_total{severity="P0"}[1m]) > 0
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "A financial safety invariant was violated"
+      - alert: ReconciliationUnsafe
+        expr: payments_reconciliation_latest_safe != 1
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "Latest durable reconciliation report contains a P0 finding"
+      - alert: ReconciliationStalled
+        expr: absent(payments_reconciliation_runs_total) or sum(increase(payments_reconciliation_runs_total[30m])) < 1
+        for: 5m
+        labels: {severity: page, class: observability}
+        annotations:
+          summary: "No durable reconciliation report completed in the expected window"
+      - alert: LedgerBalanceResidual
+        expr: abs(payments_ledger_balance_residual_atoms) > 0
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "A posted batch or verified ledger range is not balanced"
+      - alert: JournalReplayMismatch
+        expr: abs(payments_journal_replay_delta_atoms) > 0
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "Materialized balance differs from journal replay at the same cut"
+      - alert: EscrowConservationViolation
+        expr: abs(payments_escrow_conservation_delta_atoms) > 0
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "Regional spending authority is not conserved"
+      - alert: JournalSequenceGap
+        expr: payments_sequence_gap > 0
+        for: 0s
+        labels: {severity: page, class: financial_safety}
+        annotations:
+          summary: "A ledger sequence is missing below a declared watermark"
+      - alert: ExternalOutcomeUnknownTooLong
+        expr: payments_unknown_external_effects > 0
+        for: 15m
+        labels: {severity: ticket, class: reconciliation}
+        annotations:
+          summary: "An external rail effect remains UNKNOWN"
+      - alert: OutboxBacklog
+        expr: payments_outbox_lag_seconds > 60
+        for: 5m
+        labels: {severity: ticket, class: delivery}
+        annotations:
+          summary: "Transactional outbox publishing is delayed"

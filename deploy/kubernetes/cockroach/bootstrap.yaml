@@ -1,0 +1,115 @@
+# Apply manually once from the designated bootstrap context after all 12 private
+# site endpoints are reachable. Do not include this Job in continuous reconcile.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cockroach-bootstrap-root-client
+  namespace: payments
+spec:
+  secretName: cockroach-bootstrap-root-client-tls
+  duration: 1h
+  renewBefore: 20m
+  commonName: root
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cockroach-bootstrap-script
+  namespace: payments
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    set -eu
+    certs=/cockroach/client-certs
+    host=cockroach-public.payments.svc.cluster.local:26257
+
+    init_output=""
+    if ! init_output="$(cockroach init --certs-dir="$certs" --host="$host" 2>&1)"; then
+      case "$init_output" in
+        *"cluster has already been initialized"*) ;;
+        *) echo "$init_output" >&2; exit 1 ;;
+      esac
+    fi
+
+    cockroach sql --certs-dir="$certs" --host="$host" --execute="
+      CREATE DATABASE IF NOT EXISTS payment_platform;
+      ALTER RANGE default CONFIGURE ZONE USING
+        num_replicas = 7,
+        num_voters = 7,
+        constraints = '[+ledger]',
+        voter_constraints = '[+ledger]';
+      SHOW ZONE CONFIGURATION FOR RANGE default;
+    "
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cockroach-bootstrap
+  namespace: payments
+  annotations:
+    payment.example/workload-identity: cockroach-bootstrap
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cockroach-bootstrap
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: cockroach-bootstrap
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cockroach-bootstrap
+    spec:
+      serviceAccountName: cockroach-bootstrap
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: bootstrap
+          image: registry.invalid/cockroachdb/cockroach:v26.2.0-replace-with-signed-digest
+          command: ["/bin/sh", "/scripts/bootstrap.sh"]
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: script, mountPath: /scripts, readOnly: true}
+            - {name: client-tls, mountPath: /cockroach/client-certs, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: cockroach-bootstrap-script
+            defaultMode: 0500
+        - name: client-tls
+          projected:
+            defaultMode: 0400
+            sources:
+              - secret:
+                  name: cockroach-bootstrap-root-client-tls
+                  items:
+                    - {key: tls.crt, path: client.root.crt}
+                    - {key: tls.key, path: client.root.key}
+                    - {key: ca.crt, path: ca.crt}

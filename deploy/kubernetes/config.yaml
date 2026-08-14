@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-api-config
+  namespace: payments
+data:
+  ENVIRONMENT: production
+  GRPC_ADDRESS: :8443
+  METRICS_ADDRESS: 127.0.0.1:9090
+  REGION_ID: pay-a
+  ID_ISSUER: pay-a
+  DB_MAX_CONNECTIONS: "64"
+  # Authentication is the client certificate; no database password is embedded.
+  DATABASE_URL: >-
+    postgresql://payment_api@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+

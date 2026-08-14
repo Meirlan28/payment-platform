@@ -1,0 +1,262 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-api
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: payment-api
+    app.kubernetes.io/component: api
+spec:
+  # One baseline pod per DC. Capacity must be raised from RF7 benchmark results.
+  replicas: 12
+  revisionHistoryLimit: 3
+  minReadySeconds: 15
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-api
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: payment-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: payment-api
+              topologyKey: payment.example/dc
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: payment.example/dc
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-api
+      containers:
+        - name: payment-api
+          # The release pipeline MUST replace this fail-closed reference with a
+          # signed image digest; mutable tags are rejected by admission policy.
+          image: registry.invalid/payment-platform/payment-api:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: payment-api-config
+          env:
+            - name: TLS_CERT_FILE
+              value: /var/run/payment-api/server/tls.crt
+            - name: TLS_KEY_FILE
+              value: /var/run/payment-api/server/tls.key
+            - name: TLS_CLIENT_CA_FILE
+              value: /var/run/payment-api/client-ca/ca.crt
+          ports:
+            - name: grpc-mtls
+              containerPort: 8443
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: grpc-mtls
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            tcpSocket:
+              port: grpc-mtls
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket:
+              port: grpc-mtls
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 20
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: server-tls
+              mountPath: /var/run/payment-api/server
+              readOnly: true
+            - name: client-ca
+              mountPath: /var/run/payment-api/client-ca
+              readOnly: true
+            - name: cockroach-client
+              mountPath: /var/run/cockroach/client
+              readOnly: true
+            - name: cockroach-ca
+              mountPath: /var/run/cockroach/ca
+              readOnly: true
+        - name: otel-collector
+          image: registry.invalid/open-telemetry/opentelemetry-collector-contrib:0.135.0-replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/etc/otel/config.yaml"]
+          ports:
+            - name: prom-export
+              containerPort: 8889
+            - name: otel-health
+              containerPort: 13133
+          startupProbe:
+            httpGet:
+              path: /
+              port: otel-health
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: otel-health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: otel-health
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: otel-sidecar-config
+              mountPath: /etc/otel
+              readOnly: true
+            - name: otel-client-tls
+              mountPath: /var/run/otel/client
+              readOnly: true
+        # The application deliberately binds /ready and /live to loopback.
+        # Kubernetes HTTP probes originate outside the pod network namespace,
+        # so this no-listener sidecar performs the checks locally. Pod readiness
+        # is the AND of all regular containers and therefore follows DB /ready.
+        # Release engineering supplies this tiny static binary as a signed,
+        # SBOM-attested digest; it must implement the contract in operations.md.
+        - name: local-http-prober
+          image: registry.invalid/payment-platform/local-http-prober:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          args: ["idle"]
+          startupProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/ready
+                - --timeout=250ms
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/ready
+                - --timeout=250ms
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/live
+                - --timeout=250ms
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: server-tls
+          secret:
+            secretName: payment-api-server-tls
+            defaultMode: 0400
+        - name: client-ca
+          configMap:
+            name: payment-workload-client-ca
+        - name: cockroach-client
+          secret:
+            secretName: payment-api-cockroach-client-tls
+            defaultMode: 0400
+        - name: cockroach-ca
+          configMap:
+            name: cockroach-public-ca
+        - name: otel-sidecar-config
+          configMap:
+            name: otel-payment-api-sidecar
+        - name: otel-client-tls
+          secret:
+            secretName: otel-client-tls
+            defaultMode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-api
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: payment-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: payment-api
+  ports:
+    - name: grpc-mtls
+      port: 8443
+      targetPort: grpc-mtls
+    - name: prom-export
+      port: 8889
+      targetPort: prom-export

@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-payment-api-sidecar
+  namespace: payments
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    receivers:
+      prometheus/payment_api:
+        config:
+          scrape_configs:
+            - job_name: payment-api-loopback
+              scrape_interval: 10s
+              static_configs:
+                - targets: [127.0.0.1:9090]
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 127.0.0.1:4317
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 384
+        spike_limit_mib: 96
+      attributes/privacy:
+        actions:
+          - {key: enduser.id, action: delete}
+          - {key: user.email, action: delete}
+          - {key: payment.pan, action: delete}
+          - {key: payment.pii, action: delete}
+          - {key: http.request.header.authorization, action: delete}
+          - {key: db.statement, action: delete}
+      batch:
+        timeout: 2s
+        send_batch_size: 2048
+    exporters:
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        namespace: payments
+        send_timestamps: true
+      otlp/gateway:
+        endpoint: otel-gateway.observability.svc.cluster.local:4317
+        tls:
+          ca_file: /var/run/otel/client/ca.crt
+          cert_file: /var/run/otel/client/tls.crt
+          key_file: /var/run/otel/client/tls.key
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 10000
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 5m
+    service:
+      extensions: [health_check]
+      telemetry:
+        logs:
+          level: info
+      pipelines:
+        metrics:
+          receivers: [prometheus/payment_api, otlp]
+          processors: [memory_limiter, batch]
+          exporters: [prometheus, otlp/gateway]
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, attributes/privacy, batch]
+          exporters: [otlp/gateway]

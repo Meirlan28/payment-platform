@@ -1,0 +1,52 @@
+# Strimzi generates credential Secrets; no password appears in Git. Production
+# workloads consume the Secret by reference and rotate it through the operator.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: payment-outbox
+  namespace: payments
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  authentication: {type: scram-sha-512}
+  authorization:
+    type: simple
+    acls:
+      - operations: [Write, Describe]
+        resource: {type: topic, name: payment-events, patternType: literal}
+      - operations: [Write, Describe]
+        resource: {type: topic, name: payment-events-dlq, patternType: literal}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: payment-outbox-mtls
+  namespace: payments
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  authentication: {type: tls}
+  authorization:
+    type: simple
+    acls:
+      - operations: [Write, Describe]
+        resource: {type: topic, name: payment-events, patternType: literal}
+      - operations: [Write, Describe]
+        resource: {type: topic, name: payment-events-dlq, patternType: literal}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: payment-consumer
+  namespace: payments
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  authentication: {type: scram-sha-512}
+  authorization:
+    type: simple
+    acls:
+      - operations: [Read, Describe]
+        resource: {type: topic, name: payment-events, patternType: literal}
+      - operations: [Read]
+        resource: {type: group, name: payments-, patternType: prefix}

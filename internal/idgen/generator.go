@@ -1,0 +1,75 @@
+package idgen
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/example/payment-platform/internal/store"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Generator allocates disjoint counter blocks in a serializable transaction.
+// Wall time is intentionally absent from the identifier and from the lease.
+// Unused values are burned on process failure and are never reassigned.
+type Generator struct {
+	db        *pgxpool.Pool
+	issuer    string
+	blockSize int64
+
+	mu          sync.Mutex
+	incarnation int64
+	next        int64
+	end         int64
+}
+
+func New(db *pgxpool.Pool, issuer string, blockSize int64) (*Generator, error) {
+	if db == nil {
+		return nil, errors.New("id generator database is required")
+	}
+	if issuer == "" {
+		return nil, errors.New("issuer prefix is required")
+	}
+	if blockSize <= 0 {
+		return nil, errors.New("block size must be positive")
+	}
+	return &Generator{db: db, issuer: issuer, blockSize: blockSize}, nil
+}
+
+func (g *Generator) Next(ctx context.Context) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.next > g.end {
+		if err := g.allocate(ctx); err != nil {
+			return "", err
+		}
+	}
+	counter := g.next
+	g.next++
+	return fmt.Sprintf("%s-%016x-%016x", g.issuer, uint64(g.incarnation), uint64(counter)), nil
+}
+
+func (g *Generator) allocate(ctx context.Context) error {
+	return store.NewRunner(g.db).RunSerializable(ctx, func(tx pgx.Tx) error {
+		var incarnation, first, last int64
+		err := tx.QueryRow(ctx, `
+			UPDATE id_issuers
+			SET next_counter = next_counter + $2
+			WHERE issuer_prefix = $1 AND retired = false
+			RETURNING incarnation, next_counter - $2, next_counter - 1`,
+			g.issuer, g.blockSize).Scan(&incarnation, &first, &last)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("issuer %q does not exist or is retired", g.issuer)
+		}
+		if err != nil {
+			return fmt.Errorf("allocate ID block: %w", err)
+		}
+		if first <= 0 || last < first {
+			return errors.New("invalid counter block returned by authority")
+		}
+		g.incarnation, g.next, g.end = incarnation, first, last
+		return nil
+	})
+}

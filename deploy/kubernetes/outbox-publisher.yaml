@@ -1,0 +1,204 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: outbox-publisher
+  namespace: payments
+  annotations:
+    payment.example/workload-identity: outbox-publisher
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-publisher
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: outbox-publisher
+    app.kubernetes.io/component: outbox
+spec:
+  replicas: 12
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1, maxSurge: 2}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: outbox-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: outbox-publisher
+        app.kubernetes.io/component: outbox
+    spec:
+      serviceAccountName: outbox-publisher
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: outbox-publisher
+              topologyKey: payment.example/dc
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: payment.example/dc
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: outbox-publisher
+      containers:
+        - name: outbox-publisher
+          image: registry.invalid/payment-platform/outbox-publisher:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: ENVIRONMENT, value: production}
+            - {name: REGION_ID, value: pay-a}
+            - {name: KAFKA_CLIENT_ID, value: outbox-publisher-pay-a}
+            - name: PUBLISHER_OWNER
+              valueFrom:
+                fieldRef: {fieldPath: metadata.uid}
+            - {name: METRICS_ADDRESS, value: "127.0.0.1:9090"}
+            - {name: PUBLISH_BATCH_SIZE, value: "500"}
+            - {name: PUBLISH_MAX_ATTEMPTS, value: "50"}
+            - {name: DB_MAX_CONNECTIONS, value: "32"}
+            - name: DATABASE_URL
+              value: >-
+                postgresql://outbox_publisher@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+            - name: KAFKA_BROKERS
+              value: payments-kafka-kafka-sasl-bootstrap.payments.svc.cluster.local:9094
+            - name: KAFKA_SERVER_NAME
+              value: payments-kafka-kafka-sasl-bootstrap.payments.svc.cluster.local
+            - {name: KAFKA_CA_FILE, value: /var/run/kafka/ca/ca.crt}
+            - {name: KAFKA_CERT_FILE, value: /var/run/kafka/client/user.crt}
+            - {name: KAFKA_KEY_FILE, value: /var/run/kafka/client/user.key}
+            - {name: KAFKA_SASL_USERNAME, value: payment-outbox}
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: payment-outbox, key: password}
+          resources:
+            requests: {cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi}
+            limits: {cpu: "4", memory: 4Gi, ephemeral-storage: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: cockroach-client, mountPath: /var/run/cockroach/client, readOnly: true}
+            - {name: cockroach-ca, mountPath: /var/run/cockroach/ca, readOnly: true}
+            - {name: kafka-ca, mountPath: /var/run/kafka/ca, readOnly: true}
+            - {name: kafka-client, mountPath: /var/run/kafka/client, readOnly: true}
+        - name: otel-collector
+          image: registry.invalid/open-telemetry/opentelemetry-collector-contrib:0.135.0-replace-with-signed-digest
+          args: ["--config=/etc/otel/config.yaml"]
+          ports:
+            - {name: prom-export, containerPort: 8889}
+            - {name: otel-health, containerPort: 13133}
+          startupProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: otel-config, mountPath: /etc/otel, readOnly: true}
+            - {name: otel-client, mountPath: /var/run/otel/client, readOnly: true}
+        # See docs/operations.md: this sidecar opens no listener. Its exec
+        # probes reach the publisher's loopback-only DB readiness endpoint and
+        # make the readiness of the whole pod reflect /ready.
+        - name: local-http-prober
+          image: registry.invalid/payment-platform/local-http-prober:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          args: ["idle"]
+          startupProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/ready
+                - --timeout=250ms
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/ready
+                - --timeout=250ms
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            exec:
+              command:
+                - /local-http-prober
+                - check
+                - --url=http://127.0.0.1:9090/live
+                - --timeout=250ms
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: cockroach-client
+          secret: {secretName: outbox-publisher-cockroach-client-tls, defaultMode: 0400}
+        - name: cockroach-ca
+          configMap: {name: cockroach-public-ca}
+        - name: kafka-ca
+          secret:
+            secretName: payments-kafka-cluster-ca-cert
+            items: [{key: ca.crt, path: ca.crt}]
+            defaultMode: 0444
+        - name: kafka-client
+          secret:
+            secretName: payment-outbox-mtls
+            items:
+              - {key: user.crt, path: user.crt}
+              - {key: user.key, path: user.key}
+            defaultMode: 0400
+        - name: otel-config
+          configMap: {name: otel-payment-api-sidecar}
+        - name: otel-client
+          secret: {secretName: outbox-publisher-otel-client-tls, defaultMode: 0400}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: outbox-publisher
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: outbox-publisher
+spec:
+  selector:
+    app.kubernetes.io/name: outbox-publisher
+  ports:
+    - {name: prom-export, port: 8889, targetPort: prom-export}
