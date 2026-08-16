@@ -116,8 +116,13 @@ services:
     volumes: [kafka-1:/var/lib/kafka/data]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
-      interval: 5s
-      timeout: 5s
+
+      # Kafka 4.3 enumerates the whole three-broker API surface here; on a
+      # cold developer host this can take more than twenty seconds while the
+      # KRaft quorum is being unfenced.
+      interval: 10s
+      timeout: 30s
+      start_period: 60s
       retries: 30
 
   kafka-2:
@@ -131,8 +136,10 @@ services:
     volumes: [kafka-2:/var/lib/kafka/data]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
-      interval: 5s
-      timeout: 5s
+
+      interval: 10s
+      timeout: 30s
+      start_period: 60s
       retries: 30
 
   kafka-3:
@@ -146,8 +153,10 @@ services:
     volumes: [kafka-3:/var/lib/kafka/data]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
-      interval: 5s
-      timeout: 5s
+
+      interval: 10s
+      timeout: 30s
+      start_period: 60s
       retries: 30
 
   migrator:
@@ -159,6 +168,9 @@ services:
       cockroach-init: {condition: service_completed_successfully}
     environment:
       DATABASE_URL: postgresql://root@cockroach-1:26257/payment_platform?sslmode=disable
+      # Compose is an ephemeral RF3 integration topology, never a production
+      # release path. Production Jobs must set one exact target filename.
+      MIGRATION_APPLY_ALL_ACK: APPLY_ALL_CHECKED_IN_MIGRATIONS_FOR_EPHEMERAL_INTEGRATION
     networks: [payments]
 
   kafka-init:

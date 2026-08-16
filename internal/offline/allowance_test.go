@@ -1,6 +1,7 @@
 package offline
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -16,11 +17,11 @@ import (
 // localEd25519 is deliberately test-only. Production code exposes only the
 // HSM/KMS interfaces and never loads raw private keys into the process.
 type localEd25519 struct {
-	keyID   string
-	private ed25519.PrivateKey
-	public  ed25519.PublicKey
-	presentMu sync.Mutex
-	spentAllowances map[[32]byte]struct{}
+	keyID               string
+	private             ed25519.PrivateKey
+	public              ed25519.PublicKey
+	presentMu           sync.Mutex
+	spentAllowances     map[[32]byte]struct{}
 	presentationCounter uint64
 }
 
@@ -116,11 +117,15 @@ func (s *localEd25519) present(
 
 func (s *localEd25519) closure(
 	domain string,
-	epoch, fence uint64,
+	allowance Allowance,
+	fence uint64,
 ) (DomainClosure, error) {
 	closure := DomainClosure{
 		Version: ClosureVersion, AcceptanceDomain: domain,
-		ClosedSettlementEpoch: epoch, ClosedUploadFence: fence, KeyID: s.keyID,
+		AccountID: allowance.AccountID, AssetID: allowance.AssetID,
+		OriginRegion: allowance.OriginRegion, DeviceIdentityHash: allowance.DeviceIdentityHash,
+		ClosedSettlementEpoch: allowance.IssuerEpoch,
+		ClosedUploadFence:     fence, KeyID: s.keyID,
 	}
 	payload, err := closure.CanonicalPayload()
 	if err != nil {
@@ -296,6 +301,16 @@ func TestPostingMustDebitExactAllowanceAmount(t *testing.T) {
 	if err := validatePostingForPresentation(verified, posting); !errors.Is(err, ErrPostingMismatch) {
 		t.Fatalf("wrong merchant credit error = %v", err)
 	}
+	posting.Lines[2].AccountID = verified.MerchantAccountID()
+	posting.Lines = append(posting.Lines,
+		ledger.Line{AccountID: allowance.AccountID, AssetID: allowance.AssetID,
+			Side: ledger.Credit, AmountAtoms: ledger.NewAmountInt64(1)},
+		ledger.Line{AccountID: verified.MerchantAccountID(), AssetID: allowance.AssetID,
+			Side: ledger.Debit, AmountAtoms: ledger.NewAmountInt64(1)},
+	)
+	if err := validatePostingForPresentation(verified, posting); !errors.Is(err, ErrPostingMismatch) {
+		t.Fatalf("wash credit/debit error = %v", err)
+	}
 }
 
 func TestPresentationBindsMerchantDomainChallengeAndAllowance(t *testing.T) {
@@ -303,10 +318,14 @@ func TestPresentationBindsMerchantDomainChallengeAndAllowance(t *testing.T) {
 	// The original allowance verifier is not needed: canonical mutations are
 	// rejected by the device signature before a database transaction can open.
 	mutations := map[string]func(*Presentation){
-		"merchant":  func(p *Presentation) { p.MerchantAccountID += "-copied" },
-		"domain":    func(p *Presentation) { p.AcceptanceDomain += "-copied" },
-		"challenge": func(p *Presentation) { p.MerchantChallenge[0] ^= 1 },
-		"counter":   func(p *Presentation) { p.PresentationCounter++ },
+		"allowance hash":   func(p *Presentation) { p.AllowancePayloadHash[0] ^= 1 },
+		"merchant":         func(p *Presentation) { p.MerchantAccountID += "-copied" },
+		"domain":           func(p *Presentation) { p.AcceptanceDomain += "-copied" },
+		"challenge":        func(p *Presentation) { p.MerchantChallenge[0] ^= 1 },
+		"settlement epoch": func(p *Presentation) { p.SettlementEpoch++ },
+		"upload fence":     func(p *Presentation) { p.UploadFence++ },
+		"counter":          func(p *Presentation) { p.PresentationCounter++ },
+		"device key":       func(p *Presentation) { p.DeviceKeyID += "-copied" },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -319,7 +338,7 @@ func TestPresentationBindsMerchantDomainChallengeAndAllowance(t *testing.T) {
 			}
 			if err := device.VerifyPresentation(context.Background(), PresentationKeyBinding{
 				DeviceIdentityHash: changed.Allowance.DeviceIdentityHash,
-				DeviceKeyID: changed.DeviceKeyID,
+				DeviceKeyID:        changed.DeviceKeyID,
 			}, payload, changed.Signature); err == nil {
 				t.Fatal("tampered presentation signature verified")
 			}
@@ -334,5 +353,114 @@ func TestSecureElementFencesAllowanceAfterFirstChallenge(t *testing.T) {
 		first.Allowance, "different-merchant", "different-domain", secondChallenge,
 	); !errors.Is(err, ErrPresentationSpent) {
 		t.Fatalf("second presentation = %v", err)
+	}
+}
+
+func TestBareAllowanceCannotConstructVerifiedPresentation(t *testing.T) {
+	if err := validateVerifiedPresentation(VerifiedPresentation{}); !errors.Is(err, ErrInvalidPresentation) {
+		t.Fatalf("zero/bare verified presentation = %v", err)
+	}
+}
+
+func TestVerifiedValuesOwnSignatureAndEnvelopeBytes(t *testing.T) {
+	allowance, issuer := testAllowance(t)
+	expectedAllowanceSignature := append([]byte(nil), allowance.Signature...)
+	verifiedAllowance, err := verifyAllowance(context.Background(), issuer, allowance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowance.Signature[0] ^= 0xff
+	if err := validateVerifiedAllowance(verifiedAllowance); err != nil {
+		t.Fatalf("caller mutation invalidated verified allowance: %v", err)
+	}
+	if !bytes.Equal(verifiedAllowance.allowance.Signature, expectedAllowanceSignature) {
+		t.Fatal("verified allowance retained caller signature alias")
+	}
+
+	verified, presentation, _ := testVerifiedPresentation(t)
+	expectedPresentationSignature := append([]byte(nil), presentation.Signature...)
+	expectedNestedSignature := append([]byte(nil), presentation.Allowance.Signature...)
+	presentation.Signature[0] ^= 0xff
+	presentation.Allowance.Signature[0] ^= 0xff
+	if err := validateVerifiedPresentation(verified); err != nil {
+		t.Fatalf("caller mutation invalidated verified presentation: %v", err)
+	}
+	if !bytes.Equal(verified.presentation.Signature, expectedPresentationSignature) ||
+		!bytes.Equal(verified.presentation.Allowance.Signature, expectedNestedSignature) ||
+		!bytes.Equal(verified.allowance.allowance.Signature, expectedNestedSignature) {
+		t.Fatal("verified presentation retained caller signature alias")
+	}
+
+	tampered := verified
+	tampered.payload = append([]byte(nil), verified.payload...)
+	tampered.payload[0] ^= 0xff
+	if err := validateVerifiedPresentation(tampered); !errors.Is(err, ErrInvalidPresentation) {
+		t.Fatalf("tampered opaque presentation = %v", err)
+	}
+}
+
+func TestVerifiedClosureSetOwnsAndRevalidatesEnvelopeBytes(t *testing.T) {
+	allowance, _ := testAllowance(t)
+	signer := newLocalEd25519(t)
+	closure, err := signer.closure("domain-kz", allowance, allowance.Counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSignature := append([]byte(nil), closure.Signature...)
+	request := FenceRequest{
+		AllowanceID: allowance.AllowanceID,
+		ExpectedPayloadHash: func() [32]byte {
+			value, hashErr := allowance.PayloadHash()
+			if hashErr != nil {
+				t.Fatal(hashErr)
+			}
+			return value
+		}(),
+		ExpectedIssuerEpoch: allowance.IssuerEpoch, ExpectedDeviceCounter: allowance.Counter,
+		Kind: Revoked, PolicyEvidenceHash: sha256Sum([]byte("policy")),
+		DomainClosures: []DomainClosure{closure},
+	}
+	verified, err := verifyClosureSet(context.Background(), signer, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure.Signature[0] ^= 0xff
+	request.DomainClosures[0].Signature[1] ^= 0xff
+	if err := validateVerifiedClosureSet(verified); err != nil {
+		t.Fatalf("caller mutation invalidated verified closure set: %v", err)
+	}
+	if !bytes.Equal(verified.byDomain["domain-kz"].closure.Signature, expectedSignature) {
+		t.Fatal("verified closure retained caller signature alias")
+	}
+	tampered := verified
+	tampered.byDomain = make(map[string]verifiedClosure, len(verified.byDomain))
+	for domain, value := range verified.byDomain {
+		value.closure.Signature = append([]byte(nil), value.closure.Signature...)
+		value.closure.Signature[0] ^= 0xff
+		tampered.byDomain[domain] = value
+	}
+	if err := validateVerifiedClosureSet(tampered); !errors.Is(err, ErrInvalidClosure) {
+		t.Fatalf("tampered opaque closure set = %v", err)
+	}
+}
+
+func TestDomainClosureSignatureBindsIssuanceNamespace(t *testing.T) {
+	allowance, _ := testAllowance(t)
+	signer := newLocalEd25519(t)
+	closure, err := signer.closure("domain-kz", allowance, allowance.Counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := closure
+	mutated.DeviceIdentityHash[0] ^= 1
+	payload, err := mutated.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := signer.VerifyClosure(context.Background(), ClosureKeyBinding{
+		AcceptanceDomain: mutated.AcceptanceDomain,
+		KeyID:            mutated.KeyID,
+	}, payload, mutated.Signature); err == nil {
+		t.Fatal("closure signature remained valid for a different allowance hash")
 	}
 }

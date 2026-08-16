@@ -158,6 +158,18 @@ func (s *Service) Post(ctx context.Context, request PostRequest) (Receipt, error
 // serializable transaction that updates hold/payment counters, idempotency
 // receipts, FX consumption, and the outbox.
 func (s *Service) PostInTx(ctx context.Context, tx pgx.Tx, request PostRequest) (Receipt, error) {
+	return s.postInTx(ctx, tx, request, false)
+}
+
+// PreparePaymentInTx builds an immutable DRAFT and its lines but deliberately
+// does not make them financial authority. record_payment_effect is the only
+// payment workload capability that validates the exact template, finalizes
+// the DRAFT, and appends its lifecycle fact in one database call.
+func (s *Service) PreparePaymentInTx(ctx context.Context, tx pgx.Tx, request PostRequest) (Receipt, error) {
+	return s.postInTx(ctx, tx, request, true)
+}
+
+func (s *Service) postInTx(ctx context.Context, tx pgx.Tx, request PostRequest, paymentDraft bool) (Receipt, error) {
 	var empty Receipt
 	if tx == nil {
 		return empty, fmt.Errorf("%w: nil database transaction", ErrInvalidPosting)
@@ -203,13 +215,13 @@ WHERE book_id=$1`, request.BookID).Scan(&sequence, &previousBytes); err != nil {
 INSERT INTO ledger_transactions (
     transaction_id, book_id, operation_id, effect_id, transaction_kind,
     reference_transaction_id, posting_rule_version, schema_version,
-    request_hash, metadata, status, sequence_no, prev_hash, entry_hash
+    request_hash, metadata, canonical_metadata, status, sequence_no, prev_hash, entry_hash
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::JSONB,
-          'DRAFT', $11, $12, $13)
+          $11, 'DRAFT', $12, $13, $14)
 ON CONFLICT (effect_id) DO NOTHING`,
 		request.TransactionID, request.BookID, request.OperationID, request.EffectID,
 		request.Kind, reference, request.PostingRuleVersion, request.SchemaVersion,
-		request.RequestHash[:], string(metadata), sequence, previous[:], entryHash[:])
+		request.RequestHash[:], string(metadata), metadata, sequence, previous[:], entryHash[:])
 	if err != nil {
 		return empty, mapDatabaseError(err)
 	}
@@ -244,9 +256,20 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		return empty, mapDatabaseError(err)
 	}
 
+	if paymentDraft {
+		return Receipt{
+			TransactionID: request.TransactionID,
+			BookID:        request.BookID,
+			OperationID:   request.OperationID,
+			EffectID:      request.EffectID,
+			SequenceNo:    sequence,
+			EntryHash:     entryHash,
+		}, nil
+	}
+
 	var finalizedTransactionID *string
-	err = tx.QueryRow(ctx, `
-SELECT public.finalize_ledger_transaction($1)`, request.TransactionID).Scan(&finalizedTransactionID)
+	err = tx.QueryRow(ctx, `SELECT public.finalize_ledger_transaction($1)`,
+		request.TransactionID).Scan(&finalizedTransactionID)
 	if err != nil {
 		return empty, mapDatabaseError(err)
 	}
@@ -448,4 +471,11 @@ func mapDatabaseError(err error) error {
 	default:
 		return err
 	}
+}
+
+// MapPostingError preserves the ledger domain error contract for a caller
+// whose SECURITY DEFINER transition invokes the same ledger finalizer. It does
+// not hide an unknown SQL error.
+func MapPostingError(err error) error {
+	return mapDatabaseError(err)
 }

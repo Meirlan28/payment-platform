@@ -10,6 +10,9 @@ resources:
   - payment-api.yaml
   - outbox-publisher.yaml
   - reconciliation-worker.yaml
+  - audit-checkpointer.yaml
+  - audit-checkpointer-network-policy.yaml
+  - audit-checkpointer-monitoring.yaml
   - disruption-budgets.yaml
   - network-policies.yaml
   - monitoring.yaml

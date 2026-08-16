@@ -87,7 +87,12 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	registry := prometheus.NewRegistry()
-	metrics := observability.NewReconciliationMetrics(registry)
+	reconciliationMetrics := observability.NewReconciliationMetrics(registry)
+	financialMetrics := observability.NewFinancialMetrics(registry)
+	operationalMetrics, err := observability.NewOperationalCollector(pool, financialMetrics)
+	if err != nil {
+		return err
+	}
 	var ready atomic.Bool
 	metricsServer := reconciliationMetricsServer(cfg.metricsAddress, pool, registry, &ready)
 	serverErrors := make(chan error, 1)
@@ -105,9 +110,17 @@ func run(logger *slog.Logger) error {
 			var report reconciliation.Report
 			report, err = checker.Run(runCtx, "reconciliation_"+identifier)
 			if err == nil {
-				metrics.Observe(report)
+				err = financialMetrics.ObserveReport(cfg.region, report)
+			}
+			if err == nil {
+				err = reconciliationMetrics.Observe(report)
+			}
+			if err == nil {
+				err = operationalMetrics.Collect(runCtx, cfg.region)
+			}
+			if err == nil {
 				ready.Store(true)
-				logger.Info("reconciliation completed", "run_id", report.RunID,
+				logger.Info("reconciliation completed and exported", "run_id", report.RunID,
 					"status", report.Status, "findings", len(report.Findings), "books", len(report.Watermarks))
 			}
 		} else {
@@ -115,7 +128,7 @@ func run(logger *slog.Logger) error {
 		}
 		cancelRun()
 		if err != nil {
-			metrics.CycleErrors.Inc()
+			reconciliationMetrics.CycleErrors.Inc()
 			ready.Store(false)
 			logger.Error("reconciliation cycle failed", "error", err)
 		}

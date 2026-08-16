@@ -35,6 +35,11 @@ spec:
           env:
             - name: MIGRATIONS_DIR
               value: /migrations
+            # The release pipeline MUST replace this with one exact checked-in
+            # filename, for example 017_ledger_canonical_metadata_expand.sql.
+            # An unknown/placeholder value is rejected before any DB mutation.
+            - name: MIGRATION_TARGET_VERSION
+              value: replace-with-exact-reviewed-migration-filename
             - name: DATABASE_URL
               value: >-
                 postgresql://root@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
@@ -67,4 +72,3 @@ spec:
         - name: cockroach-ca
           configMap:
             name: cockroach-public-ca
-

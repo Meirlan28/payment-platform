@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
+	"strings"
 
 	"github.com/example/payment-platform/internal/ledger"
 	"github.com/example/payment-platform/internal/store"
@@ -22,10 +22,10 @@ const (
 )
 
 type Service struct {
-	transactions *store.Runner
-	ids          ledger.IDGenerator
-	signer       Signer
-	verifier     Verifier
+	transactions         *store.Runner
+	ids                  ledger.IDGenerator
+	signer               Signer
+	verifier             Verifier
 	presentationVerifier PresentationVerifier
 	closureVerifier      ClosureVerifier
 }
@@ -61,30 +61,57 @@ func (s *Service) ConfigureAcceptanceDomain(ctx context.Context, domain Acceptan
 		last = &value
 	}
 	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-INSERT INTO offline_acceptance_domains
- (acceptance_domain, closure_key_id, first_settlement_epoch, last_settlement_epoch)
-VALUES ($1,$2,$3,$4)
-ON CONFLICT (acceptance_domain) DO NOTHING`, domain.Name, domain.ClosureKeyID, first, last)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-		var key string
-		var storedFirst int64
-		var storedLast *int64
-		if err := tx.QueryRow(ctx, `
-SELECT closure_key_id, first_settlement_epoch, last_settlement_epoch
-FROM offline_acceptance_domains WHERE acceptance_domain=$1`, domain.Name).Scan(
-			&key, &storedFirst, &storedLast); err != nil {
-			return err
-		}
-		if key != domain.ClosureKeyID || storedFirst != first || !sameNullableInt64(storedLast, last) {
-			return ErrAcceptanceDomain
-		}
-		return nil
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+SELECT public.configure_offline_acceptance_domain($1,$2,$3,$4)`,
+			domain.Name, domain.ClosureKeyID, first, last).Scan(&inserted)
+		return mapProcedureError(err)
+	})
+}
+
+// RotateAcceptanceDomainKey appends one retirement/revocation boundary and
+// one new activation at the same logical epoch. It never updates key history.
+func (s *Service) RotateAcceptanceDomainKey(
+	ctx context.Context,
+	rotation AcceptanceDomainKeyRotation,
+) error {
+	if s == nil || s.transactions == nil {
+		return ErrInvalidArgument
+	}
+	if err := rotation.validate(); err != nil {
+		return err
+	}
+	epoch, _ := checkedInt64(rotation.EffectiveEpoch)
+	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		var changed bool
+		err := tx.QueryRow(ctx, `
+SELECT public.rotate_offline_acceptance_domain_key($1,$2,$3,$4,$5)`,
+			rotation.AcceptanceDomain, rotation.ExpectedKeyID, rotation.NewKeyID,
+			epoch, string(rotation.PriorKeyReason)).Scan(&changed)
+		return mapProcedureError(err)
+	})
+}
+
+// TerminateAcceptanceDomainKey appends a RETIRED or REVOKED boundary without
+// activating a replacement. The domain fails closed for later epochs.
+func (s *Service) TerminateAcceptanceDomainKey(
+	ctx context.Context,
+	termination AcceptanceDomainKeyTermination,
+) error {
+	if s == nil || s.transactions == nil {
+		return ErrInvalidArgument
+	}
+	if err := termination.validate(); err != nil {
+		return err
+	}
+	epoch, _ := checkedInt64(termination.EffectiveEpoch)
+	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		var changed bool
+		err := tx.QueryRow(ctx, `
+SELECT public.terminate_offline_acceptance_domain_key($1,$2,$3,$4)`,
+			termination.AcceptanceDomain, termination.ExpectedKeyID, epoch,
+			string(termination.Reason)).Scan(&changed)
+		return mapProcedureError(err)
 	})
 }
 
@@ -109,31 +136,12 @@ func (s *Service) EnrollDevice(ctx context.Context, device Device) error {
 	}
 	epoch, _ := checkedInt64(device.IssuerEpoch)
 	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-INSERT INTO offline_device_counters
- (account_id, asset_id, origin_region, device_identity_hash, issuer_epoch)
-VALUES ($1,$2,$3,$4,$5)
-ON CONFLICT (account_id, asset_id, origin_region, device_identity_hash) DO NOTHING`,
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+SELECT public.enroll_offline_device($1,$2,$3,$4,$5)`,
 			device.AccountID, device.AssetID, device.OriginRegion,
-			device.DeviceIdentityHash[:], epoch)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-		var storedEpoch int64
-		if err := tx.QueryRow(ctx, `
-SELECT issuer_epoch FROM offline_device_counters
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND device_identity_hash=$4`,
-			device.AccountID, device.AssetID, device.OriginRegion,
-			device.DeviceIdentityHash[:]).Scan(&storedEpoch); err != nil {
-			return err
-		}
-		if storedEpoch != epoch {
-			return ErrDeviceConflict
-		}
-		return nil
+			device.DeviceIdentityHash[:], epoch).Scan(&inserted)
+		return mapProcedureError(err)
 	})
 }
 
@@ -153,36 +161,12 @@ func (s *Service) AdvanceIssuerEpoch(ctx context.Context, device Device, nextEpo
 		return ErrInvalidArgument
 	}
 	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-UPDATE offline_device_counters
-SET issuer_epoch=$5, last_counter=0, fence_version=fence_version+1,
-    updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3
-  AND device_identity_hash=$4 AND issuer_epoch=$6`,
+		var changed bool
+		err := tx.QueryRow(ctx, `
+SELECT public.advance_offline_issuer_epoch($1,$2,$3,$4,$5,$6)`,
 			device.AccountID, device.AssetID, device.OriginRegion,
-			device.DeviceIdentityHash[:], next, current)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-		var stored int64
-		err = tx.QueryRow(ctx, `
-SELECT issuer_epoch FROM offline_device_counters
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND device_identity_hash=$4`,
-			device.AccountID, device.AssetID, device.OriginRegion,
-			device.DeviceIdentityHash[:]).Scan(&stored)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrDeviceConflict
-		}
-		if err != nil {
-			return err
-		}
-		if stored == next {
-			return nil
-		}
-		return ErrDeviceConflict
+			device.DeviceIdentityHash[:], current, next).Scan(&changed)
+		return mapProcedureError(err)
 	})
 }
 
@@ -294,71 +278,23 @@ func (s *Service) prepare(ctx context.Context, request IssueRequest, activeKeyID
 			result, resultState = stored, state
 			return nil
 		}
-
-		var epoch, lastCounter int64
+		var inserted bool
 		err = tx.QueryRow(ctx, `
-SELECT issuer_epoch, last_counter FROM offline_device_counters
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND device_identity_hash=$4
-FOR UPDATE`, request.AccountID, request.AssetID, request.OriginRegion,
-			request.DeviceIdentityHash[:]).Scan(&epoch, &lastCounter)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrDeviceConflict
+SELECT public.prepare_offline_allowance($1,$2,$3,$4,$5,$6,$7)`,
+			request.AllowanceID, request.AccountID, request.AssetID,
+			request.OriginRegion, request.DeviceIdentityHash[:],
+			request.Amount.String(), activeKeyID).Scan(&inserted)
+		if err := mapProcedureError(err); err != nil {
+			return err
 		}
+		stored, state, found, err = loadAllowance(ctx, tx, request.AllowanceID, true)
 		if err != nil {
 			return err
 		}
-		var acceptanceDomains int64
-		if err := tx.QueryRow(ctx, `
-SELECT count(*) FROM offline_acceptance_domains
-WHERE first_settlement_epoch <= $1
-  AND (last_settlement_epoch IS NULL OR last_settlement_epoch >= $1)`, epoch).Scan(
-			&acceptanceDomains); err != nil {
-			return err
+		if !found || !matchesIssueRequest(stored, request) {
+			return ErrAllowanceConflict
 		}
-		if acceptanceDomains == 0 {
-			return ErrAcceptanceDomain
-		}
-		if lastCounter == math.MaxInt64 {
-			return ErrCounterExhausted
-		}
-		counter := lastCounter + 1
-		tag, err := tx.Exec(ctx, `
-UPDATE offline_device_counters
-SET last_counter=$5, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3
-  AND device_identity_hash=$4 AND last_counter=$6`,
-			request.AccountID, request.AssetID, request.OriginRegion,
-			request.DeviceIdentityHash[:], counter, lastCounter)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return ErrDeviceConflict
-		}
-		candidate := Allowance{
-			Version: AllowanceVersion, AllowanceID: request.AllowanceID,
-			AccountID: request.AccountID, AssetID: request.AssetID,
-			OriginRegion: request.OriginRegion, DeviceIdentityHash: request.DeviceIdentityHash,
-			Counter: uint64(counter), Amount: request.Amount, IssuerEpoch: uint64(epoch),
-			KeyID: activeKeyID,
-		}
-		payload, err := candidate.CanonicalPayload()
-		if err != nil {
-			return err
-		}
-		hash := allowanceHash(payload)
-		_, err = tx.Exec(ctx, `
-INSERT INTO offline_allowances
- (allowance_id, account_id, asset_id, origin_region, device_identity_hash,
-  device_counter, amount, issuer_epoch, key_id, canonical_payload, payload_hash)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-			candidate.AllowanceID, candidate.AccountID, candidate.AssetID,
-			candidate.OriginRegion, candidate.DeviceIdentityHash[:], counter,
-			candidate.Amount.String(), epoch, candidate.KeyID, payload, hash[:])
-		if err != nil {
-			return err
-		}
-		result, resultState = candidate, statePrepared
+		result, resultState = stored, state
 		return nil
 	})
 	return result, resultState, err
@@ -367,6 +303,9 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 // activate contains the complete economic issuance commit. PREPARED rows are
 // harmless counter reservations and are deliberately outside conservation.
 func (s *Service) activate(ctx context.Context, verified VerifiedAllowance) (Allowance, error) {
+	if err := validateVerifiedAllowance(verified); err != nil {
+		return Allowance{}, err
+	}
 	var result Allowance
 	err := s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
 		stored, state, found, err := loadAllowance(ctx, tx, verified.allowance.AllowanceID, true)
@@ -383,52 +322,21 @@ func (s *Service) activate(ctx context.Context, verified VerifiedAllowance) (All
 			result = stored
 			return nil
 		}
-		var currentEpoch int64
+		var changed bool
 		err = tx.QueryRow(ctx, `
-SELECT issuer_epoch FROM offline_device_counters
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND device_identity_hash=$4
-FOR UPDATE`, stored.AccountID, stored.AssetID, stored.OriginRegion,
-			stored.DeviceIdentityHash[:]).Scan(&currentEpoch)
+SELECT public.activate_offline_allowance($1,$2,$3)`, stored.AllowanceID,
+			verified.payloadHash[:], verified.allowance.Signature).Scan(&changed)
+		if err := mapProcedureError(err); err != nil {
+			return err
+		}
+		stored, _, found, err = loadAllowance(ctx, tx, stored.AllowanceID, false)
 		if err != nil {
 			return err
 		}
-		if currentEpoch != int64(stored.IssuerEpoch) {
-			return ErrFenceConflict
-		}
-
-		tag, err := tx.Exec(ctx, `
-UPDATE escrow_regional_rights
-SET available=available-$4, version=version+1, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND region=$3 AND available >= $4`,
-			stored.AccountID, stored.AssetID, stored.OriginRegion, stored.Amount.String())
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return ErrInsufficientRights
-		}
-		_, err = tx.Exec(ctx, `
-INSERT INTO escrow_offline_issued (account_id, asset_id, origin_region, amount)
-VALUES ($1,$2,$3,$4)
-ON CONFLICT (account_id, asset_id, origin_region) DO UPDATE
-SET amount=escrow_offline_issued.amount+excluded.amount,
-    version=escrow_offline_issued.version+1,
-    updated_at=transaction_timestamp()`,
-			stored.AccountID, stored.AssetID, stored.OriginRegion, stored.Amount.String())
-		if err != nil {
-			return err
-		}
-		tag, err = tx.Exec(ctx, `
-UPDATE offline_allowances
-SET signature=$2, state='ISSUED', issued_at=transaction_timestamp()
-WHERE allowance_id=$1 AND state='PREPARED'`, stored.AllowanceID, verified.allowance.Signature)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
+		if !found || !sameVerifiedAllowance(stored, verified) ||
+			!bytes.Equal(stored.Signature, verified.allowance.Signature) {
 			return ErrAllowanceConflict
 		}
-		stored.Signature = append([]byte(nil), verified.allowance.Signature...)
 		result = stored
 		return nil
 	})
@@ -462,7 +370,7 @@ func (s *Service) RedeemAndPost(
 		PostingRequestHash: posting.RequestHash,
 	}
 	var result AtomicRedemption
-	err = s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+	err := s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
 		ledgerReceipt, inner := journal.PostInTx(ctx, tx, posting)
 		if inner != nil {
 			return inner
@@ -531,61 +439,27 @@ func (s *Service) RedeemPresentationInTx(
 		return Redemption{}, ErrNotIssued
 	}
 
-	_, err = tx.Exec(ctx, `
-INSERT INTO offline_redemption_receipts
- (allowance_id, payload_hash, effect_hash, effect_id,
-  ledger_transaction_id, posting_request_hash, presentation_payload_hash,
-  presentation_hash, merchant_account_id, acceptance_domain, challenge_hash,
-  settlement_epoch, upload_fence, presentation_counter, device_identity_hash,
-  device_key_id, presentation_payload, presentation_signature)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+	var changed bool
+	err = tx.QueryRow(ctx, `
+SELECT public.redeem_offline_presentation(
+ $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		stored.AllowanceID, verified.allowance.payloadHash[:], effectHash[:],
 		effect.EffectID, effect.LedgerTransactionID, effect.PostingRequestHash[:],
 		verified.payloadHash[:], verified.presentationHash[:],
 		verified.presentation.MerchantAccountID, verified.presentation.AcceptanceDomain,
-		verified.challengeHash[:], int64(verified.presentation.SettlementEpoch),
+		verified.challengeHash[:], verified.presentation.MerchantChallenge[:],
+		int64(verified.presentation.SettlementEpoch),
 		int64(verified.presentation.UploadFence), int64(verified.presentation.PresentationCounter),
 		verified.presentation.Allowance.DeviceIdentityHash[:], verified.presentation.DeviceKeyID,
-		verified.payload, verified.presentation.Signature)
-	if err != nil {
+		verified.payload, verified.presentation.Signature).Scan(&changed)
+	if err := mapProcedureError(err); err != nil {
 		var databaseError *pgconn.PgError
 		if errors.As(err, &databaseError) && databaseError.Code == "23505" {
 			return Redemption{}, ErrRedemptionConflict
 		}
 		return Redemption{}, err
 	}
-	tag, err := tx.Exec(ctx, `
-UPDATE escrow_offline_issued
-SET amount=amount-$4, version=version+1, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND amount >= $4`,
-		stored.AccountID, stored.AssetID, stored.OriginRegion, stored.Amount.String())
-	if err != nil {
-		return Redemption{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return Redemption{}, ErrConservationViolation
-	}
-	tag, err = tx.Exec(ctx, `
-UPDATE escrow_authorities
-SET total_authority=total_authority-$3, version=version+1
-WHERE account_id=$1 AND asset_id=$2 AND total_authority >= $3`,
-		stored.AccountID, stored.AssetID, stored.Amount.String())
-	if err != nil {
-		return Redemption{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return Redemption{}, ErrConservationViolation
-	}
-	tag, err = tx.Exec(ctx, `
-UPDATE offline_allowances
-SET state='REDEEMED', redeemed_at=transaction_timestamp()
-WHERE allowance_id=$1 AND state='ISSUED'`, stored.AllowanceID)
-	if err != nil {
-		return Redemption{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return Redemption{}, ErrConservationViolation
-	}
+	result.Duplicate = !changed
 	return result, nil
 }
 
@@ -648,8 +522,8 @@ func (s *Service) terminateVerifiedInTx(
 	if err := request.validate(); err != nil {
 		return NonRedemptionProof{}, err
 	}
-	if len(closures.byDomain) == 0 || closures.setHash == ([32]byte{}) {
-		return NonRedemptionProof{}, ErrIncompleteClosure
+	if err := validateVerifiedClosureSet(closures); err != nil {
+		return NonRedemptionProof{}, err
 	}
 	stored, state, found, err := loadAllowance(ctx, tx, request.AllowanceID, true)
 	if err != nil {
@@ -693,84 +567,24 @@ func (s *Service) terminateVerifiedInTx(
 		return NonRedemptionProof{}, ErrAlreadyRedeemed
 	}
 
-	var epoch, lastCounter, fenceVersion int64
+	var fenceVersion int64
 	err = tx.QueryRow(ctx, `
-SELECT issuer_epoch, last_counter, fence_version
-FROM offline_device_counters
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND device_identity_hash=$4
-FOR UPDATE`, stored.AccountID, stored.AssetID, stored.OriginRegion,
-		stored.DeviceIdentityHash[:]).Scan(&epoch, &lastCounter, &fenceVersion)
+SELECT public.terminate_offline_allowance($1,$2,$3,$4,$5,$6,$7)`,
+		stored.AllowanceID, string(request.Kind), request.ExpectedPayloadHash[:],
+		int64(request.ExpectedIssuerEpoch), int64(request.ExpectedDeviceCounter),
+		request.PolicyEvidenceHash[:], closures.setHash[:]).Scan(&fenceVersion)
+	if err := mapProcedureError(err); err != nil {
+		return NonRedemptionProof{}, err
+	}
+	proof, proofFound, err := loadProof(ctx, tx, stored.AllowanceID)
 	if err != nil {
 		return NonRedemptionProof{}, err
 	}
-	if lastCounter < int64(stored.Counter) || epoch < int64(stored.IssuerEpoch) || fenceVersion == math.MaxInt64 {
-		return NonRedemptionProof{}, ErrFenceConflict
-	}
-	nextFence := fenceVersion + 1
-	tag, err := tx.Exec(ctx, `
-UPDATE offline_device_counters
-SET fence_version=$5, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3
-  AND device_identity_hash=$4 AND fence_version=$6`,
-		stored.AccountID, stored.AssetID, stored.OriginRegion,
-		stored.DeviceIdentityHash[:], nextFence, fenceVersion)
-	if err != nil {
-		return NonRedemptionProof{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return NonRedemptionProof{}, ErrFenceConflict
-	}
-	tag, err = tx.Exec(ctx, `
-UPDATE escrow_offline_issued
-SET amount=amount-$4, version=version+1, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3 AND amount >= $4`,
-		stored.AccountID, stored.AssetID, stored.OriginRegion, stored.Amount.String())
-	if err != nil {
-		return NonRedemptionProof{}, err
-	}
-	if tag.RowsAffected() != 1 {
+	if !proofFound || proof.FenceVersion != uint64(fenceVersion) ||
+		!matchesProof(proof, request, closures.setHash) {
 		return NonRedemptionProof{}, ErrConservationViolation
 	}
-	tag, err = tx.Exec(ctx, `
-UPDATE escrow_regional_rights
-SET available=available+$4, version=version+1, updated_at=transaction_timestamp()
-WHERE account_id=$1 AND asset_id=$2 AND region=$3`,
-		stored.AccountID, stored.AssetID, stored.OriginRegion, stored.Amount.String())
-	if err != nil {
-		return NonRedemptionProof{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return NonRedemptionProof{}, ErrConservationViolation
-	}
-	tag, err = tx.Exec(ctx, `
-UPDATE offline_allowances
-SET state=$2, terminal_at=transaction_timestamp()
-WHERE allowance_id=$1 AND state='ISSUED'`, stored.AllowanceID, string(request.Kind))
-	if err != nil {
-		return NonRedemptionProof{}, err
-	}
-	if tag.RowsAffected() != 1 {
-		return NonRedemptionProof{}, ErrConservationViolation
-	}
-	proofHash := hashProof(request, uint64(nextFence), closures.setHash)
-	_, err = tx.Exec(ctx, `
-INSERT INTO offline_non_redemption_proofs
- (allowance_id, terminal_kind, payload_hash, issuer_epoch, device_counter,
-  fence_version, policy_evidence_hash, closure_set_hash, proof_hash)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, stored.AllowanceID, string(request.Kind),
-		request.ExpectedPayloadHash[:], int64(request.ExpectedIssuerEpoch),
-		int64(request.ExpectedDeviceCounter), nextFence,
-		request.PolicyEvidenceHash[:], closures.setHash[:], proofHash[:])
-	if err != nil {
-		return NonRedemptionProof{}, err
-	}
-	return NonRedemptionProof{
-		AllowanceID: stored.AllowanceID, Kind: request.Kind,
-		PayloadHash: request.ExpectedPayloadHash, IssuerEpoch: request.ExpectedIssuerEpoch,
-		DeviceCounter: request.ExpectedDeviceCounter, FenceVersion: uint64(nextFence),
-		PolicyEvidenceHash: request.PolicyEvidenceHash, ClosureSetHash: closures.setHash,
-		ProofHash: proofHash,
-	}, nil
+	return proof, nil
 }
 
 func validateAndPersistClosures(
@@ -780,7 +594,7 @@ func validateAndPersistClosures(
 	closures verifiedClosureSet,
 ) error {
 	rows, err := tx.Query(ctx, `
-SELECT acceptance_domain, closure_key_id
+SELECT acceptance_domain
 FROM offline_acceptance_domains
 WHERE first_settlement_epoch <= $1
   AND (last_settlement_epoch IS NULL OR last_settlement_epoch >= $1)
@@ -791,13 +605,17 @@ ORDER BY acceptance_domain`, int64(allowance.IssuerEpoch))
 	defer rows.Close()
 	required := 0
 	for rows.Next() {
-		var domain, keyID string
-		if err := rows.Scan(&domain, &keyID); err != nil {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
 			return err
 		}
 		required++
 		value, ok := closures.byDomain[domain]
-		if !ok || value.closure.KeyID != keyID ||
+		if !ok ||
+			value.closure.AccountID != allowance.AccountID ||
+			value.closure.AssetID != allowance.AssetID ||
+			value.closure.OriginRegion != allowance.OriginRegion ||
+			value.closure.DeviceIdentityHash != allowance.DeviceIdentityHash ||
 			value.closure.ClosedSettlementEpoch < allowance.IssuerEpoch ||
 			(value.closure.ClosedSettlementEpoch == allowance.IssuerEpoch &&
 				value.closure.ClosedUploadFence < allowance.Counter) {
@@ -812,41 +630,16 @@ ORDER BY acceptance_domain`, int64(allowance.IssuerEpoch))
 		return ErrIncompleteClosure
 	}
 	for domain, value := range closures.byDomain {
-		_, err := tx.Exec(ctx, `
-INSERT INTO offline_domain_closure_evidence
- (evidence_hash, acceptance_domain, closed_settlement_epoch,
-  closed_upload_fence, key_id, payload_hash, canonical_payload, signature)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-ON CONFLICT (evidence_hash) DO NOTHING`, value.evidenceHash[:], domain,
-			int64(value.closure.ClosedSettlementEpoch), int64(value.closure.ClosedUploadFence),
-			value.closure.KeyID, value.payloadHash[:], value.payload, value.closure.Signature)
-		if err != nil {
-			return err
-		}
-		var storedDomain, storedKey string
-		var storedEpoch, storedFence int64
-		var storedPayloadHash, storedPayload, storedSignature []byte
-		if err := tx.QueryRow(ctx, `
-SELECT acceptance_domain, closed_settlement_epoch, closed_upload_fence,
-       key_id, payload_hash, canonical_payload, signature
-FROM offline_domain_closure_evidence WHERE evidence_hash=$1`, value.evidenceHash[:]).Scan(
-			&storedDomain, &storedEpoch, &storedFence, &storedKey, &storedPayloadHash,
-			&storedPayload, &storedSignature); err != nil {
-			return err
-		}
-		if storedDomain != domain || storedKey != value.closure.KeyID ||
-			storedEpoch != int64(value.closure.ClosedSettlementEpoch) ||
-			storedFence != int64(value.closure.ClosedUploadFence) ||
-			!bytes.Equal(storedPayloadHash, value.payloadHash[:]) ||
-			!bytes.Equal(storedPayload, value.payload) ||
-			!bytes.Equal(storedSignature, value.closure.Signature) {
-			return ErrFenceConflict
-		}
-		_, err = tx.Exec(ctx, `
-INSERT INTO offline_termination_closure_links
- (allowance_id, acceptance_domain, evidence_hash)
-VALUES ($1,$2,$3)`, allowance.AllowanceID, domain, value.evidenceHash[:])
-		if err != nil {
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+SELECT public.record_offline_domain_closure(
+ $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			allowance.AllowanceID, value.evidenceHash[:], domain,
+			value.closure.AccountID, value.closure.AssetID, value.closure.OriginRegion,
+			value.closure.DeviceIdentityHash[:], int64(value.closure.ClosedSettlementEpoch),
+			int64(value.closure.ClosedUploadFence), value.closure.KeyID,
+			value.payloadHash[:], value.payload, value.closure.Signature).Scan(&inserted)
+		if err := mapProcedureError(err); err != nil {
 			return err
 		}
 	}
@@ -905,21 +698,22 @@ func (s *Service) CheckConservation(ctx context.Context, accountID, assetID stri
 }
 
 type storedReceipt struct {
-	payloadHash         [32]byte
-	effectHash          [32]byte
+	payloadHash             [32]byte
+	effectHash              [32]byte
 	presentationPayloadHash [32]byte
-	presentationHash    [32]byte
-	challengeHash       [32]byte
-	effectID            string
-	ledgerTransactionID string
-	postingRequestHash  [32]byte
-	merchantAccountID   string
-	acceptanceDomain    string
-	settlementEpoch     uint64
-	uploadFence         uint64
-	presentationCounter uint64
-	deviceIdentityHash  [32]byte
-	deviceKeyID         string
+	presentationHash        [32]byte
+	challengeHash           [32]byte
+	merchantChallenge       [32]byte
+	effectID                string
+	ledgerTransactionID     string
+	postingRequestHash      [32]byte
+	merchantAccountID       string
+	acceptanceDomain        string
+	settlementEpoch         uint64
+	uploadFence             uint64
+	presentationCounter     uint64
+	deviceIdentityHash      [32]byte
+	deviceKeyID             string
 }
 
 func loadAllowance(ctx context.Context, tx pgx.Tx, allowanceID string, lock bool) (Allowance, string, bool, error) {
@@ -970,17 +764,17 @@ FROM offline_allowances WHERE allowance_id=$1`
 func loadRedemptionReceipt(ctx context.Context, tx pgx.Tx, allowanceID string) (storedReceipt, bool, error) {
 	var result storedReceipt
 	var payloadHash, effectHash, postingHash, presentationPayloadHash,
-		presentationHash, challengeHash, deviceIdentityHash []byte
+		presentationHash, challengeHash, merchantChallenge, deviceIdentityHash []byte
 	var settlementEpoch, uploadFence, presentationCounter int64
 	err := tx.QueryRow(ctx, `
 SELECT payload_hash, effect_hash, effect_id, ledger_transaction_id, posting_request_hash,
        presentation_payload_hash, presentation_hash, merchant_account_id,
-       acceptance_domain, challenge_hash, settlement_epoch, upload_fence,
+       acceptance_domain, challenge_hash, merchant_challenge, settlement_epoch, upload_fence,
        presentation_counter, device_identity_hash, device_key_id
 FROM offline_redemption_receipts WHERE allowance_id=$1`, allowanceID).Scan(
 		&payloadHash, &effectHash, &result.effectID, &result.ledgerTransactionID, &postingHash,
 		&presentationPayloadHash, &presentationHash, &result.merchantAccountID,
-		&result.acceptanceDomain, &challengeHash, &settlementEpoch, &uploadFence,
+		&result.acceptanceDomain, &challengeHash, &merchantChallenge, &settlementEpoch, &uploadFence,
 		&presentationCounter, &deviceIdentityHash, &result.deviceKeyID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return storedReceipt{}, false, nil
@@ -990,7 +784,7 @@ FROM offline_redemption_receipts WHERE allowance_id=$1`, allowanceID).Scan(
 	}
 	if len(payloadHash) != 32 || len(effectHash) != 32 || len(postingHash) != 32 ||
 		len(presentationPayloadHash) != 32 || len(presentationHash) != 32 ||
-		len(challengeHash) != 32 || len(deviceIdentityHash) != 32 ||
+		len(challengeHash) != 32 || len(merchantChallenge) != 32 || len(deviceIdentityHash) != 32 ||
 		settlementEpoch <= 0 || uploadFence <= 0 || presentationCounter <= 0 ||
 		!validText(result.merchantAccountID) || !validText(result.acceptanceDomain) ||
 		!validText(result.deviceKeyID) {
@@ -1002,6 +796,7 @@ FROM offline_redemption_receipts WHERE allowance_id=$1`, allowanceID).Scan(
 	copy(result.presentationPayloadHash[:], presentationPayloadHash)
 	copy(result.presentationHash[:], presentationHash)
 	copy(result.challengeHash[:], challengeHash)
+	copy(result.merchantChallenge[:], merchantChallenge)
 	copy(result.deviceIdentityHash[:], deviceIdentityHash)
 	result.settlementEpoch = uint64(settlementEpoch)
 	result.uploadFence = uint64(uploadFence)
@@ -1055,6 +850,9 @@ func matchesIssueRequest(allowance Allowance, request IssueRequest) bool {
 }
 
 func sameVerifiedAllowance(stored Allowance, verified VerifiedAllowance) bool {
+	if err := validateVerifiedAllowance(verified); err != nil {
+		return false
+	}
 	hash, err := stored.PayloadHash()
 	return err == nil && hash == verified.payloadHash
 }
@@ -1072,6 +870,7 @@ func sameRedemption(
 		stored.presentationPayloadHash == verified.payloadHash &&
 		stored.presentationHash == verified.presentationHash &&
 		stored.challengeHash == verified.challengeHash &&
+		stored.merchantChallenge == p.MerchantChallenge &&
 		stored.merchantAccountID == p.MerchantAccountID &&
 		stored.acceptanceDomain == p.AcceptanceDomain &&
 		stored.settlementEpoch == p.SettlementEpoch && stored.uploadFence == p.UploadFence &&
@@ -1081,11 +880,62 @@ func sameRedemption(
 }
 
 func validateVerifiedPresentation(verified VerifiedPresentation) error {
-	if len(verified.payload) == 0 || verified.payloadHash == ([32]byte{}) ||
-		verified.presentationHash == ([32]byte{}) || verified.challengeHash == ([32]byte{}) ||
-		verified.allowance.payloadHash == ([32]byte{}) ||
-		verified.presentation.AllowancePayloadHash != verified.allowance.payloadHash {
+	if err := validateVerifiedAllowance(verified.allowance); err != nil ||
+		len(verified.payload) == 0 || len(verified.presentation.Signature) == 0 ||
+		verified.payloadHash == ([32]byte{}) || verified.presentationHash == ([32]byte{}) ||
+		verified.challengeHash == ([32]byte{}) ||
+		verified.presentation.AllowancePayloadHash != verified.allowance.payloadHash ||
+		!sameAllowanceEnvelope(verified.presentation.Allowance, verified.allowance.allowance) {
 		return ErrInvalidPresentation
+	}
+	payload, err := verified.presentation.CanonicalPayload()
+	if err != nil || !bytes.Equal(payload, verified.payload) ||
+		sha256Sum(payload) != verified.payloadHash ||
+		presentationEnvelopeHash(payload, verified.presentation.Signature) != verified.presentationHash ||
+		sha256Sum(verified.presentation.MerchantChallenge[:]) != verified.challengeHash {
+		return ErrInvalidPresentation
+	}
+	return nil
+}
+
+func validateVerifiedAllowance(verified VerifiedAllowance) error {
+	if len(verified.payload) == 0 || len(verified.allowance.Signature) == 0 ||
+		verified.payloadHash == ([32]byte{}) {
+		return ErrInvalidSignature
+	}
+	payload, err := verified.allowance.CanonicalPayload()
+	if err != nil || !bytes.Equal(payload, verified.payload) || allowanceHash(payload) != verified.payloadHash {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
+func sameAllowanceEnvelope(left, right Allowance) bool {
+	return left.Version == right.Version && left.AllowanceID == right.AllowanceID &&
+		left.AccountID == right.AccountID && left.AssetID == right.AssetID &&
+		left.OriginRegion == right.OriginRegion &&
+		left.DeviceIdentityHash == right.DeviceIdentityHash && left.Counter == right.Counter &&
+		left.Amount.Cmp(right.Amount) == 0 && left.IssuerEpoch == right.IssuerEpoch &&
+		left.KeyID == right.KeyID && bytes.Equal(left.Signature, right.Signature)
+}
+
+func validateVerifiedClosureSet(closures verifiedClosureSet) error {
+	if len(closures.byDomain) == 0 || closures.setHash == ([32]byte{}) {
+		return ErrInvalidClosure
+	}
+	for domain, value := range closures.byDomain {
+		if domain != value.closure.AcceptanceDomain || len(value.closure.Signature) == 0 {
+			return ErrInvalidClosure
+		}
+		payload, err := value.closure.CanonicalPayload()
+		if err != nil || !bytes.Equal(payload, value.payload) ||
+			sha256Sum(payload) != value.payloadHash ||
+			closureEnvelopeHash(payload, value.closure.Signature) != value.evidenceHash {
+			return ErrInvalidClosure
+		}
+	}
+	if closureSetHash(closures.byDomain) != closures.setHash {
+		return ErrInvalidClosure
 	}
 	return nil
 }
@@ -1094,6 +944,8 @@ func validatePostingForPresentation(verified VerifiedPresentation, posting ledge
 	allowance := verified.presentation.Allowance
 	var debited ledger.Amount
 	var credited ledger.Amount
+	var sourceCredits ledger.Amount
+	var merchantDebits ledger.Amount
 	for _, line := range posting.Lines {
 		if line.AssetID == allowance.AssetID && line.AccountID == allowance.AccountID &&
 			line.Side == ledger.Debit {
@@ -1101,6 +953,14 @@ func validatePostingForPresentation(verified VerifiedPresentation, posting ledge
 			debited, err = debited.Add(line.AmountAtoms)
 			if err != nil {
 				return fmt.Errorf("%w: source debit overflow", ErrPostingMismatch)
+			}
+		}
+		if line.AssetID == allowance.AssetID && line.AccountID == allowance.AccountID &&
+			line.Side == ledger.Credit {
+			var err error
+			sourceCredits, err = sourceCredits.Add(line.AmountAtoms)
+			if err != nil {
+				return fmt.Errorf("%w: source credit overflow", ErrPostingMismatch)
 			}
 		}
 		if line.AssetID == allowance.AssetID &&
@@ -1112,10 +972,21 @@ func validatePostingForPresentation(verified VerifiedPresentation, posting ledge
 				return fmt.Errorf("%w: merchant credit overflow", ErrPostingMismatch)
 			}
 		}
+		if line.AssetID == allowance.AssetID &&
+			line.AccountID == verified.presentation.MerchantAccountID &&
+			line.Side == ledger.Debit {
+			var err error
+			merchantDebits, err = merchantDebits.Add(line.AmountAtoms)
+			if err != nil {
+				return fmt.Errorf("%w: merchant debit overflow", ErrPostingMismatch)
+			}
+		}
 	}
-	if debited.Cmp(allowance.Amount) != 0 || credited.Cmp(allowance.Amount) != 0 {
-		return fmt.Errorf("%w: debit=%s merchant_credit=%s allowance=%s merchant=%s",
-			ErrPostingMismatch, debited.String(), credited.String(), allowance.Amount.String(),
+	if debited.Cmp(allowance.Amount) != 0 || credited.Cmp(allowance.Amount) != 0 ||
+		!sourceCredits.IsZero() || !merchantDebits.IsZero() {
+		return fmt.Errorf("%w: source_debit=%s source_credit=%s merchant_credit=%s merchant_debit=%s allowance=%s merchant=%s",
+			ErrPostingMismatch, debited.String(), sourceCredits.String(), credited.String(),
+			merchantDebits.String(), allowance.Amount.String(),
 			verified.presentation.MerchantAccountID)
 	}
 	return nil
@@ -1126,4 +997,54 @@ func sameNullableInt64(left, right *int64) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+func mapProcedureError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var databaseError *pgconn.PgError
+	if !errors.As(err, &databaseError) || databaseError.Code != "P0001" {
+		// Preserve serialization/deadlock SQLSTATEs for store.Runner retries.
+		return err
+	}
+	message := strings.ToLower(databaseError.Message)
+	var semantic error
+	switch {
+	case strings.Contains(message, "counter is exhausted"):
+		semantic = ErrCounterExhausted
+	case strings.Contains(message, "insufficient regional rights"):
+		semantic = ErrInsufficientRights
+	case strings.Contains(message, "already redeemed"):
+		semantic = ErrAlreadyRedeemed
+	case strings.Contains(message, "is terminal"):
+		semantic = ErrAllowanceTerminal
+	case strings.Contains(message, "not issued"):
+		semantic = ErrNotIssued
+	case strings.Contains(message, "not found"), strings.Contains(message, "not prepared"):
+		semantic = ErrAllowanceNotFound
+	case strings.Contains(message, "receipt conflict"):
+		semantic = ErrRedemptionConflict
+	case strings.Contains(message, "canonical envelope"),
+		strings.Contains(message, "presentation/effect"):
+		semantic = ErrInvalidPresentation
+	case strings.Contains(message, "closure"):
+		semantic = ErrIncompleteClosure
+	case strings.Contains(message, "key rotation"), strings.Contains(message, "key termination"),
+		strings.Contains(message, "key activation"), strings.Contains(message, "key lifecycle"):
+		semantic = ErrKeyLifecycleConflict
+	case strings.Contains(message, "device") || strings.Contains(message, "issuer epoch compare"):
+		semantic = ErrDeviceConflict
+	case strings.Contains(message, "fence") || strings.Contains(message, "epoch is fenced"):
+		semantic = ErrFenceConflict
+	case strings.Contains(message, "allowance id conflict"), strings.Contains(message, "activation conflict"):
+		semantic = ErrAllowanceConflict
+	case strings.Contains(message, "authority"):
+		semantic = ErrConservationViolation
+	case strings.Contains(message, "acceptance-domain"):
+		semantic = ErrAcceptanceDomain
+	default:
+		semantic = ErrInvalidArgument
+	}
+	return fmt.Errorf("%w: %s", semantic, databaseError.Message)
 }

@@ -69,10 +69,11 @@ func TestFoldBalanceIgnoresCommittedDraftLines(t *testing.T) {
 		_, err := tx.Exec(ctx, `
 INSERT INTO ledger_transactions (
  transaction_id, book_id, operation_id, effect_id, transaction_kind,
- posting_rule_version, request_hash, sequence_no, prev_hash, entry_hash
-) VALUES ($1,$2,$3,$4,'TEST_DRAFT','v1',$5,$6,$7,$8)`,
+ posting_rule_version, request_hash, metadata, canonical_metadata,
+ sequence_no, prev_hash, entry_hash
+) VALUES ($1,$2,$3,$4,'TEST_DRAFT','v1',$5,'{}'::JSONB,$6,$7,$8,$9)`,
 			"draft-tx-"+suffix, bookID, "draft-op-"+suffix, "draft-effect-"+suffix,
-			requestHash[:], sequence, previous, entry[:])
+			requestHash[:], []byte("{}"), sequence, previous, entry[:])
 		if err != nil {
 			return err
 		}

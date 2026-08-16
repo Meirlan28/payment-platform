@@ -43,13 +43,33 @@ spec:
             - --set=errexit=true
             - >-
               --execute=CREATE USER IF NOT EXISTS payment_api;
-              GRANT ledger_writer, id_allocator, payment_authorizer TO payment_api;
+              REVOKE ledger_writer FROM payment_api;
+              GRANT payment_journal_runtime, payment_runtime, payment_escrow_runtime,
+              idempotency_runtime, outbox_enqueue_runtime, id_allocator,
+              payment_authorizer TO payment_api;
               CREATE USER IF NOT EXISTS outbox_publisher;
               GRANT outbox_publisher_runtime TO outbox_publisher;
+              CREATE USER IF NOT EXISTS fx_worker;
+              GRANT ledger_writer, fx_runtime, idempotency_runtime,
+              outbox_enqueue_runtime, id_allocator TO fx_worker;
+              CREATE USER IF NOT EXISTS escrow_transfer_worker;
+              GRANT escrow_transfer_runtime TO escrow_transfer_worker;
+              CREATE USER IF NOT EXISTS offline_worker;
+              GRANT ledger_writer, offline_runtime, id_allocator TO offline_worker;
+              CREATE USER IF NOT EXISTS offline_configuration;
+              GRANT offline_configuration_runtime TO offline_configuration;
+              CREATE USER IF NOT EXISTS workflow_worker;
+              GRANT transport_inbox_runtime, saga_runtime TO workflow_worker;
+              CREATE USER IF NOT EXISTS rail_worker;
+              GRANT rail_runtime TO rail_worker;
+              CREATE USER IF NOT EXISTS cashback_repair_worker;
+              GRANT ledger_writer, cashback_repair_runtime TO cashback_repair_worker;
               CREATE USER IF NOT EXISTS reference_migration;
               GRANT reference_migration_operator TO reference_migration;
               CREATE USER IF NOT EXISTS reconciliation_worker;
               GRANT reconciliation_runtime, id_allocator TO reconciliation_worker;
+              CREATE USER IF NOT EXISTS audit_checkpointer;
+              GRANT audit_checkpointer_runtime TO audit_checkpointer;
           resources:
             requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
             limits: {cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi}

@@ -49,3 +49,19 @@ func TestMerkleRootChangesOnMutation(t *testing.T) {
 		t.Fatal("Merkle root did not change")
 	}
 }
+
+func TestVerifiedCanonicalMetadataRejectsAlternateSerialization(t *testing.T) {
+	if _, err := verifiedCanonicalMetadata(
+		[]byte(`{"nested":{"b":2,"a":1}}`),
+		[]byte(`{"nested": {"a":1,"b":2}}`),
+	); err == nil {
+		t.Fatalf("expected non-canonical bytes to fail, got %v", err)
+	}
+	got, err := verifiedCanonicalMetadata(
+		[]byte(`{"nested":{"b":2,"a":1}}`),
+		[]byte(`{"nested":{"a":1,"b":2}}`),
+	)
+	if err != nil || string(got) != `{"nested":{"a":1,"b":2}}` {
+		t.Fatalf("canonical metadata failed: %q %v", got, err)
+	}
+}

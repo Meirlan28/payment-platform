@@ -109,6 +109,54 @@ WHERE account_id=$1 AND asset_id=$2 AND total_authority >= $3`,
 	})
 }
 
+// PaymentSpendInTx is the least-privilege online-payment path. Migration 019
+// grants payment_api EXECUTE on the database transition but no direct UPDATE
+// or INSERT privilege on escrow authority tables. The database verifies that
+// the effect is already tied, in this same transaction, to one POSTED payment
+// journal debit of the exact available account/asset/amount.
+func PaymentSpendInTx(ctx context.Context, tx pgx.Tx, request EffectRequest) (EffectReceipt, error) {
+	return applyPaymentEffect(ctx, tx, EffectSpend, request)
+}
+
+// CashbackRepairSpendInTx is deliberately SPEND-only and manifest-bound. The
+// repair credential is not allowed to invoke the generic payment RETURN path.
+func CashbackRepairSpendInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	repairID string,
+	request EffectRequest,
+) (EffectReceipt, error) {
+	if tx == nil || repairID == "" {
+		return EffectReceipt{}, ErrInvalidArgument
+	}
+	if err := request.validate(); err != nil {
+		return EffectReceipt{}, err
+	}
+	hash := hashEffect(EffectSpend, request)
+	receipt := EffectReceipt{EffectID: request.EffectID, Kind: EffectSpend, RequestHash: hash}
+	var applied bool
+	err := tx.QueryRow(ctx, `
+SELECT public.apply_cashback_repair_escrow_spend($1,$2,$3,$4,$5,$6,$7)`,
+		repairID, request.EffectID, request.AccountID, request.AssetID,
+		request.Region, request.Amount.String(), hash[:]).Scan(&applied)
+	if err == nil {
+		receipt.Duplicate = !applied
+		return receipt, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Message {
+		case "escrow insufficient rights":
+			return EffectReceipt{}, ErrInsufficientRights
+		case "escrow effect conflict":
+			return EffectReceipt{}, ErrEffectConflict
+		case "invalid payment escrow effect request":
+			return EffectReceipt{}, ErrInvalidArgument
+		}
+	}
+	return EffectReceipt{}, err
+}
+
 // Return restores previously consumed regional authority. Its receipt is
 // committed with the associated reversal/refund when ReturnInTx is used.
 func (s *Service) Return(ctx context.Context, request EffectRequest) (EffectReceipt, error) {
@@ -153,6 +201,50 @@ WHERE account_id=$1 AND asset_id=$2`,
 		}
 		return nil
 	})
+}
+
+// PaymentReturnInTx is the matching least-privilege release/refund/cashback
+// path. A bare RETURN with a fresh effect ID is rejected unless a matching
+// immutable payment fact and exact POSTED ledger credit already exist.
+func PaymentReturnInTx(ctx context.Context, tx pgx.Tx, request EffectRequest) (EffectReceipt, error) {
+	return applyPaymentEffect(ctx, tx, EffectReturn, request)
+}
+
+func applyPaymentEffect(
+	ctx context.Context,
+	tx pgx.Tx,
+	kind EffectKind,
+	request EffectRequest,
+) (EffectReceipt, error) {
+	if tx == nil || !kind.valid() {
+		return EffectReceipt{}, ErrInvalidArgument
+	}
+	if err := request.validate(); err != nil {
+		return EffectReceipt{}, err
+	}
+	hash := hashEffect(kind, request)
+	receipt := EffectReceipt{EffectID: request.EffectID, Kind: kind, RequestHash: hash}
+	var applied bool
+	err := tx.QueryRow(ctx, `
+SELECT public.apply_payment_escrow_effect($1,$2,$3,$4,$5,$6,$7)`,
+		request.EffectID, string(kind), request.AccountID, request.AssetID,
+		request.Region, request.Amount.String(), hash[:]).Scan(&applied)
+	if err == nil {
+		receipt.Duplicate = !applied
+		return receipt, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Message == "escrow insufficient rights":
+			return EffectReceipt{}, ErrInsufficientRights
+		case pgErr.Message == "escrow effect conflict":
+			return EffectReceipt{}, ErrEffectConflict
+		case pgErr.Message == "invalid payment escrow effect request":
+			return EffectReceipt{}, ErrInvalidArgument
+		}
+	}
+	return EffectReceipt{}, err
 }
 
 func applyEffect(ctx context.Context, tx pgx.Tx, kind EffectKind, request EffectRequest, mutate func() error) (EffectReceipt, error) {

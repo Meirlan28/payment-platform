@@ -222,7 +222,7 @@ spec:
             matchExpressions:
               - key: app.kubernetes.io/name
                 operator: In
-                values: [payment-api, outbox-publisher, reconciliation-worker, schema-migrator, reference-migration, database-identities-bootstrap, cockroach-bootstrap]
+                values: [payment-api, outbox-publisher, reconciliation-worker, audit-checkpointer, schema-migrator, reference-migration, database-identities-bootstrap, cockroach-bootstrap]
       ports:
         - {port: 26257, protocol: TCP}
     - from:

@@ -1,0 +1,73 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: audit-checkpointer
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  namespaceSelector:
+    matchNames: [payments]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit-checkpointer
+  endpoints:
+    - port: prom-export
+      interval: 10s
+      scrapeTimeout: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: audit-checkpointer-safety
+  namespace: payments
+  labels:
+    monitoring: platform
+spec:
+  groups:
+    - name: audit-checkpointer-safety
+      interval: 10s
+      rules:
+        - alert: AuditWORMConflict
+          expr: increase(payments_audit_worm_conflicts_total[1m]) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Deterministic audit object key contains conflicting immutable bytes
+            runbook: docs/operations.md#audit-worm-conflict-p0
+        - alert: AuditSignatureFailure
+          expr: increase(payments_audit_signature_failures_total[1m]) > 0
+          for: 0m
+          labels: {severity: page, class: financial_safety}
+          annotations:
+            summary: Vault HSM checkpoint signing or verification failed
+        - alert: AuditCheckpointLagHigh
+          expr: max(payments_audit_checkpoint_lag_entries) > 100000
+          for: 1m
+          labels: {severity: page, class: audit}
+          annotations:
+            summary: A closed ledger range exceeds the signed-checkpoint readiness bound
+        - alert: AuditWORMExportLag
+          expr: max(payments_audit_export_lag_entries) > 0
+          for: 5m
+          labels: {severity: page, class: audit}
+          annotations:
+            summary: A signed checkpoint lacks a receipt from one immutable sink
+        - alert: AuditWORMSinkUnavailable
+          expr: min(payments_audit_worm_sink_ready) != 1
+          for: 1m
+          labels: {severity: page, class: audit}
+          annotations:
+            summary: WORM identity/versioning/Object-Lock controls are unavailable
+        - alert: AuditCheckpointerNotReady
+          expr: min(payments_audit_worker_ready) != 1
+          for: 2m
+          labels: {severity: page, class: audit}
+          annotations:
+            summary: An audit shard is not ready
+        - alert: AuditCheckpointerMetricsAbsent
+          expr: absent(payments_audit_worker_ready)
+          for: 2m
+          labels: {severity: page, class: observability}
+          annotations:
+            summary: Audit-checkpointer invariant status is unknown

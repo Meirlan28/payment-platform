@@ -37,6 +37,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/reconciliation-worker ./cmd/reconciliation-worker
 
+FROM source AS audit-checkpointer-build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/audit-checkpointer ./cmd/audit-checkpointer
+
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=api-build /out/payment-api /payment-api
 USER nonroot:nonroot
@@ -56,3 +61,8 @@ FROM gcr.io/distroless/static-debian12:nonroot AS reconciliation
 COPY --from=reconciliation-build /out/reconciliation-worker /reconciliation-worker
 USER nonroot:nonroot
 ENTRYPOINT ["/reconciliation-worker"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS audit-checkpointer
+COPY --from=audit-checkpointer-build /out/audit-checkpointer /audit-checkpointer
+USER nonroot:nonroot
+ENTRYPOINT ["/audit-checkpointer"]

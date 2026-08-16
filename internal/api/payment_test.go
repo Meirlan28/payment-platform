@@ -25,29 +25,39 @@ func (f *fakeAuthorizer) Authorize(_ context.Context, request authz.Request) err
 type fakePayments struct {
 	authorized payment.HoldRequest
 	receipt    payment.Receipt
+	err        error
 }
 
 func (f *fakePayments) Authorize(_ context.Context, request payment.HoldRequest) (payment.Receipt, error) {
 	f.authorized = request
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) Capture(context.Context, payment.CaptureRequest) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) Release(context.Context, payment.ReleaseRequest) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) Reversal(context.Context, payment.ReleaseRequest) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) Refund(context.Context, payment.RefundRequest) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) Chargeback(context.Context, payment.ChargebackRequest) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
 }
 func (f *fakePayments) GetForScope(context.Context, string, string) (payment.Receipt, error) {
-	return f.receipt, nil
+	return f.receipt, f.err
+}
+
+type fakeErrorObserver struct {
+	operation string
+	err       error
+}
+
+func (f *fakeErrorObserver) ObservePaymentError(operation string, err error) {
+	f.operation, f.err = operation, err
 }
 
 func TestAuthorizeScopesIdempotencyToVerifiedPrincipalAndRegion(t *testing.T) {
@@ -112,5 +122,25 @@ func TestAuthorizeFailsClosedForUnauthorizedAccount(t *testing.T) {
 	}
 	if fake.authorized.BookID != "" {
 		t.Fatal("financial command ran after authorization denial")
+	}
+}
+
+func TestFinancialCommandFailureIsObservedBeforeGRPCMapping(t *testing.T) {
+	fake := &fakePayments{err: payment.ErrOverRefund}
+	observer := &fakeErrorObserver{}
+	server := &PaymentServer{
+		Payments: fake, RegionID: "region-a", AuthorizeAccounts: &fakeAuthorizer{}, ErrorObserver: observer,
+		ResolvePrincipal: func(context.Context) (string, error) { return "spiffe://test/client", nil },
+	}
+	_, err := server.Refund(context.Background(), &paymentv1.RefundRequest{
+		IdempotencyKey: "refund-key", BookId: "book", PaymentId: "payment",
+		OriginalCaptureTransactionId: "capture", MerchantDebitAccountId: "merchant",
+		Amount: &paymentv1.Money{AssetId: "USD", Atoms: "1"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unexpected gRPC error: %v", err)
+	}
+	if observer.operation != "refund" || observer.err != payment.ErrOverRefund {
+		t.Fatalf("observer did not receive the typed domain failure: %#v", observer)
 	}
 }

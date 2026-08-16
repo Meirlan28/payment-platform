@@ -150,6 +150,15 @@ server:
         disable_mlock = true
         cluster_name = "payment-platform-vault"
 
+        # The audit Transit key is created by a maker-checker ceremony as
+        # type=managed_key and points at a non-replaceable PKCS#11 object via
+        # this library. Signing operations execute inside the HSM; seal-wrap
+        # alone is not treated as proof of HSM signing.
+        kms_library "pkcs11" {
+          name = "payment-audit-hsm"
+          library = "/usr/local/lib/pkcs11/vendor-pkcs11.so"
+        }
+
         listener "tcp" {
           address                  = "[::]:8200"
           cluster_address          = "[::]:8201"

@@ -390,6 +390,15 @@ Allowance выпускается только через атомарное пе
 
 До online redemption такой платёж имеет статус `PROVISIONAL_OFFLINE`, а не ledger `SUCCESS`. Абсолютно предотвратить двойную трату клонированного bearer token без online coordination или доверенного hardware невозможно. Контракт ограничивает maximum loss размером allowance/merchant risk limit, но не обещает нулевой fraud loss для произвольного клонированного устройства.
 
+Возврат outstanding `O_d` в online regional right не следует из timeout или
+отсутствия redemption receipt. Он требует immutable closure evidence от каждого
+настроенного acceptance domain: domain подтверждает полный upload/reject и
+fencing дальнейшего приёма, а подпись связывает issuance namespace
+`(account, asset, origin, device)` с логическим watermark. Это позволяет batch
+closure ранних allowances одного namespace, но
+исключает применение между независимыми device counters; correctness не
+зависит от часов.
+
 ## 9. Consistency contract
 
 | Объект/решение | Модель |

@@ -40,12 +40,17 @@ type PaymentAuthorizer interface {
 	Authorize(context.Context, authz.Request) error
 }
 
+type PaymentErrorObserver interface {
+	ObservePaymentError(operation string, err error)
+}
+
 type PaymentServer struct {
 	paymentv1.UnimplementedPaymentServiceServer
 	Payments          PaymentCommands
 	RegionID          string
 	ResolvePrincipal  PrincipalResolver
 	AuthorizeAccounts PaymentAuthorizer
+	ErrorObserver     PaymentErrorObserver
 }
 
 func (s *PaymentServer) Authorize(ctx context.Context, request *paymentv1.AuthorizeRequest) (*paymentv1.AuthorizeResponse, error) {
@@ -84,7 +89,7 @@ func (s *PaymentServer) Authorize(ctx context.Context, request *paymentv1.Author
 		AuthorityRegion: request.GetAuthorityRegion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("authorize", err)
 	}
 	return &paymentv1.AuthorizeResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -137,7 +142,7 @@ func (s *PaymentServer) Capture(ctx context.Context, request *paymentv1.CaptureR
 		PostingRuleVersion:       request.GetPostingRuleVersion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("capture", err)
 	}
 	return &paymentv1.CaptureResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -160,7 +165,7 @@ func (s *PaymentServer) Release(ctx context.Context, request *paymentv1.ReleaseR
 		Amount: amount.amount, PostingRuleVersion: request.GetPostingRuleVersion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("release", err)
 	}
 	return &paymentv1.ReleaseResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -183,7 +188,7 @@ func (s *PaymentServer) Reversal(ctx context.Context, request *paymentv1.Reversa
 		Amount: amount.amount, PostingRuleVersion: request.GetPostingRuleVersion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("reversal", err)
 	}
 	return &paymentv1.ReversalResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -213,7 +218,7 @@ func (s *PaymentServer) Refund(ctx context.Context, request *paymentv1.RefundReq
 		PostingRuleVersion: request.GetPostingRuleVersion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("refund", err)
 	}
 	return &paymentv1.RefundResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -244,7 +249,7 @@ func (s *PaymentServer) Chargeback(ctx context.Context, request *paymentv1.Charg
 		PostingRuleVersion:           request.GetPostingRuleVersion(),
 	})
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("chargeback", err)
 	}
 	return &paymentv1.ChargebackResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -259,7 +264,7 @@ func (s *PaymentServer) GetPayment(ctx context.Context, request *paymentv1.GetPa
 	}
 	receipt, err := s.Payments.GetForScope(ctx, "principal/"+principal, request.GetPaymentId())
 	if err != nil {
-		return nil, mapError(err)
+		return nil, s.mapError("get_payment", err)
 	}
 	return &paymentv1.GetPaymentResponse{Payment: paymentMessage(receipt)}, nil
 }
@@ -387,4 +392,11 @@ func mapError(err error) error {
 	default:
 		return status.Error(codes.Internal, fmt.Sprintf("financial command failed (%T)", err))
 	}
+}
+
+func (s *PaymentServer) mapError(operation string, err error) error {
+	if s != nil && s.ErrorObserver != nil {
+		s.ErrorObserver.ObservePaymentError(operation, err)
+	}
+	return mapError(err)
 }

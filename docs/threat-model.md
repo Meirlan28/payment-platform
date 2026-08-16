@@ -79,10 +79,46 @@ restore и incident response, а не ложное обещание BFT.
   обходит более новую fencing generation.
 - Cockroach TLS certificate CN совпадает с LOGIN user. LOGIN users получают
   только NOLOGIN capability roles; пароли в Git отсутствуют.
-- `payment_api` получает posting/id-allocation/authorization roles;
-  `outbox_publisher` — только outbox claim/update; reference migration — только
-  shadow/control tables. Schema migration использует короткоживущий root cert в
-  отдельном reviewed Job.
+- `payment_api` получает только композицию `payment_journal_runtime`,
+  `payment_runtime`, `payment_escrow_runtime`, `idempotency_runtime`,
+  `outbox_enqueue_runtime`, `id_allocator` и `payment_authorizer`;
+  `outbox_publisher` — только outbox claim/update. FX, escrow transfer, offline,
+  inbox/saga, external rail, cashback repair и reference migration используют
+  отдельные LOGIN identities и непересекающиеся NOLOGIN capabilities. Schema
+  migration использует короткоживущий root cert в отдельном reviewed Job.
+- `payment_journal_runtime` может записать только нефинансовый `DRAFT`; у него
+  нет `EXECUTE` ни generic, ни payment finalizer. Единственный
+  `record_payment_effect` внутри одного `SECURITY DEFINER` вызова проверяет
+  canonical request hash, principal/account intent, kind-specific line
+  distribution и lifecycle counters, переводит DRAFT в `POSTED` и добавляет
+  immutable effect; для `CAPTURE` там же создаётся ровно одна financial row.
+  Finalizer-owned marker нельзя подать в `INSERT`, поэтому даже оставшийся у
+  другого workload `ledger_writer` не может изготовить payment proof.
+- `payment_escrow_runtime` не имеет `INSERT/UPDATE` на authority tables. Он
+  вызывает только `SECURITY DEFINER` переход, который заново вычисляет request
+  hash и принимает exact effect из предыдущей payment boundary; receipt и
+  authority delta коммитятся в той же SERIALIZABLE transaction. Все relations
+  внутри функций schema-qualified, поскольку CockroachDB этой версии не
+  поддерживает function-level fixed `search_path`.
+- После payment contract `cashback_repair_runtime` не может вызвать generic
+  escrow `RETURN`: ему оставлен только manifest-bound `SPEND`, который требует
+  exact `PLANNED` repair manifest, его `CASHBACK_REVERSAL` journal и связанный
+  immutable `REVERSAL` effect. Сам `cashback_repair_worker` всё ещё получает
+  `ledger_writer` и поэтому является явно признанной financial TCB для
+  value-reducing compensating postings. Компрометация этого workload может
+  создать некорректную, но balanced correction; она не получает escrow-mint
+  capability и должна выявляться reconciliation/WORM audit. Полное исключение
+  repair worker из TCB требует отдельной kind-specific posting procedure.
+- `offline_runtime` после contract также не имеет raw `INSERT/UPDATE` на
+  authority/allowance/receipt/proof tables. SECURITY DEFINER procedures
+  самостоятельно связывают canonical allowance/presentation/closure bytes,
+  hashes, signature-envelope hash, logical key window, POSTED ledger effect и
+  conservative authority delta. SQL намеренно **не** выполняет Ed25519/HSM
+  verification: verified opaque value создаёт доверенный HSM/secure-element
+  adapter до retryable DB transaction. Компрометация этого adapter, обход его
+  вызова или arbitrary-code execution с правом вызывать procedures может
+  подделать authenticity при сохранении DB conservation; это вне
+  non-Byzantine safety claim и является P0 containment boundary.
 - Kubernetes service accounts не дают DB privilege сами по себе и не монтируются
   туда, где не нужны. Vault/cert-manager auth ограничен namespace, audience,
   role и issuance policy.
@@ -96,11 +132,11 @@ restore и incident response, а не ложное обещание BFT.
 | Retry в другом регионе | Deterministic authority routing и глобальный idempotency record | Без quorum authority ответ pending/unavailable; replacement effect запрещён |
 | Split brain/stale worker | RF7/Q4, Raft term, durable worker/authority fence | Произвольный partition не даёт quorum обоим sides одного range |
 | Forged/replayed rights transfer | HSM signature, source `IN_TRANSIT`, certificate hash, destination unique consumption, generation fence | Украденный signing key — P0 key compromise |
-| Offline clone/replay | Device identity hash, issuer epoch, monotonic counter, single-use allowance и bounded escrow | Полностью офлайн merchant не знает глобальный state; acceptance provisional/bounded |
+| Offline clone/replay | Secure-element presentation связывает exact allowance, merchant/domain/challenge/counter; permanent dedup; возврат authority требует namespace-bound closure от каждого domain; append-only key windows отклоняют retired/revoked key на последующем logical epoch | Полностью офлайн merchant не знает глобальный state; acceptance provisional/bounded. Ради historical verification старый key остаётся valid внутри прежнего logical window: компрометированный private key может подделать backdated evidence этого окна, поэтому HSM compromise требует P0 containment/reconciliation, а не обещания SQL-BFT |
 | Partial multi-effect payment | Все local monetary lines/limits/outbox в одной DB transaction; external work — saga | Compensation создаёт новую posting, history не удаляется |
 | Crash после Kafka publish до DB mark | Event ID стабилен; Kafka idempotent producer; consumer inbox+effect dedup | Delivery at-least-once, не «exactly once transport» |
 | Kafka tamper/reorder/poison | TLS/SASL ACL, RF7/MISR4, payload schema/hash, aggregate version, DLQ policy | Kafka не authority; replay из outbox; poison не пропускается молча |
-| Direct DB mutation | Least privilege, immutable triggers/finalizer, SQL audit, hash chain/Merkle/WORM | Root/quorum actor может повредить live data; external anchor выявляет divergence |
+| Direct DB mutation | Workload-specific roles, payment template+effect boundary, EXECUTE-only escrow transition, immutable triggers/finalizer, SQL audit, hash chain/Merkle/WORM | `ledger_writer` остаётся TCB только у явно перечисленных non-payment workloads, включая value-reducing cashback repair; `payment_api` его не получает. Repair имеет только manifest-bound escrow SPEND, не RETURN. Cockroach видит workload и immutable principal capabilities, но не независимо завершённый клиентский TLS handshake: полностью захваченный payment pod способен инициировать допустимую lifecycle-команду в пределах этой роли, однако не arbitrary journal/mint. Root/quorum actor может повредить live data; external anchor выявляет divergence |
 | Buggy posting/rule | Pinned rule/build/schema version, canary/shadow, invariants, signed repair manifest | Business-correct but balanced bug исправляется compensating entries |
 | Refund/chargeback abuse | Ownership capability, original capture link, cumulative bound under SERIALIZABLE | Юридический loss/insolvency отражается отдельным account, не стиранием payable |
 | Clock manipulation | Деньги упорядочиваются sequence/Raft/fence; skewed DB node quarantined | Clock-based expiry не является единственной защитой |

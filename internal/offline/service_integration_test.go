@@ -4,12 +4,16 @@ package offline
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +22,7 @@ import (
 	"github.com/example/payment-platform/internal/ledger"
 	"github.com/example/payment-platform/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,6 +42,20 @@ func (unavailablePresentationVerifier) VerifyPresentation(
 }
 
 type unavailableClosureVerifier struct{}
+
+type closureVerifierSet map[string]*localEd25519
+
+func (v closureVerifierSet) VerifyClosure(
+	ctx context.Context,
+	binding ClosureKeyBinding,
+	payload, signature []byte,
+) error {
+	verifier, ok := v[binding.KeyID]
+	if !ok {
+		return ErrInvalidClosure
+	}
+	return verifier.VerifyClosure(ctx, binding, payload, signature)
+}
 
 func (unavailableClosureVerifier) VerifyClosure(
 	context.Context, ClosureKeyBinding, []byte, []byte,
@@ -68,6 +87,7 @@ type integrationFixture struct {
 	bookID    string
 	region    string
 	domain    string
+	epoch     uint64
 	device    [32]byte
 	deviceSE  *localEd25519
 	closure   *localEd25519
@@ -129,22 +149,24 @@ func newIntegrationFixture(t *testing.T, authority int64) *integrationFixture {
 	closure.keyID = "closure-" + suffix
 	service := NewService(runner, ids, issuer, issuer, deviceSE, closure)
 	domain := "acceptance-" + suffix
+	epoch := integrationEpoch(t)
 	if err := service.ConfigureAcceptanceDomain(ctx, AcceptanceDomain{
-		Name: domain, ClosureKeyID: closure.keyID, FirstSettlementEpoch: 1,
+		Name: domain, ClosureKeyID: closure.keyID,
+		FirstSettlementEpoch: epoch, LastSettlementEpoch: epoch + 4,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	device := deviceSE.identityHash()
 	if err := service.EnrollDevice(ctx, Device{
 		AccountID: accountID, AssetID: assetID, OriginRegion: region,
-		DeviceIdentityHash: device, IssuerEpoch: 1,
+		DeviceIdentityHash: device, IssuerEpoch: epoch,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	return &integrationFixture{
 		ctx: ctx, pool: pool, runner: runner, service: service, journal: journal,
 		accountID: accountID, assetID: assetID, merchant: merchant, bookID: bookID,
-		region: region, domain: domain, device: device, deviceSE: deviceSE,
+		region: region, domain: domain, epoch: epoch, device: device, deviceSE: deviceSE,
 		closure: closure, ids: ids,
 	}
 }
@@ -182,7 +204,9 @@ func (f *integrationFixture) presentation(t *testing.T, allowance Allowance) Ver
 
 func (f *integrationFixture) closureFor(t *testing.T, allowance Allowance) DomainClosure {
 	t.Helper()
-	closure, err := f.closure.closure(f.domain, allowance.IssuerEpoch, allowance.Counter)
+	closure, err := f.closure.closure(
+		f.domain, allowance, allowance.Counter,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,10 +225,10 @@ func (f *integrationFixture) fenceRequest(
 	}
 	return FenceRequest{
 		AllowanceID: allowance.AllowanceID, ExpectedPayloadHash: payloadHash,
-		ExpectedIssuerEpoch: allowance.IssuerEpoch,
+		ExpectedIssuerEpoch:   allowance.IssuerEpoch,
 		ExpectedDeviceCounter: allowance.Counter, Kind: Revoked,
 		PolicyEvidenceHash: sha256.Sum256([]byte("policy:" + allowance.AllowanceID)),
-		DomainClosures: closures,
+		DomainClosures:     closures,
 	}
 }
 
@@ -282,6 +306,35 @@ func TestOfflineIssueAndLedgerRedemptionAreExactlyOnce(t *testing.T) {
 		t.Fatal("redemption whose ledger debit differs from the allowance succeeded")
 	}
 	assertConservation(t, fixture, "100", "60", "40")
+	washPost := post
+	washPost.TransactionID += "-wash"
+	washPost.EffectID += "-wash"
+	washPost.OperationID += "-wash"
+	washPost.RequestHash = sha256.Sum256([]byte("offline-wash-post"))
+	washPost.Lines = append([]ledger.Line(nil), post.Lines...)
+	washPost.Lines = append(washPost.Lines,
+		ledger.Line{AccountID: fixture.accountID, AssetID: fixture.assetID,
+			Side: ledger.Credit, AmountAtoms: ledger.NewAmountInt64(1)},
+		ledger.Line{AccountID: fixture.merchant, AssetID: fixture.assetID,
+			Side: ledger.Debit, AmountAtoms: ledger.NewAmountInt64(1)},
+	)
+	washEffect := RedemptionEffect{
+		EffectID: washPost.EffectID, LedgerTransactionID: washPost.TransactionID,
+		PostingRequestHash: washPost.RequestHash,
+	}
+	err = fixture.runner.RunSerializable(fixture.ctx, func(tx pgx.Tx) error {
+		if _, inner := fixture.journal.PostInTx(fixture.ctx, tx, washPost); inner != nil {
+			return inner
+		}
+		_, inner := fixture.service.RedeemPresentationInTx(
+			fixture.ctx, tx, verified, washEffect,
+		)
+		return inner
+	})
+	if err == nil {
+		t.Fatal("database accepted wash credits/debits around exact offline amount")
+	}
+	assertConservation(t, fixture, "100", "60", "40")
 
 	var first Redemption
 	err = fixture.runner.RunSerializable(fixture.ctx, func(tx pgx.Tx) error {
@@ -321,6 +374,68 @@ func TestOfflineIssueAndLedgerRedemptionAreExactlyOnce(t *testing.T) {
 		t.Fatalf("different second redemption = %v", err)
 	}
 	assertConservation(t, fixture, "60", "60", "0")
+}
+
+func TestBareAllowanceCannotRedeemOrPostLedger(t *testing.T) {
+	fixture := newIntegrationFixture(t, 40)
+	allowance := fixture.issue(t, 20)
+	effect := RedemptionEffect{
+		EffectID:            "bare-effect-" + allowance.AllowanceID,
+		LedgerTransactionID: "bare-tx-" + allowance.AllowanceID,
+		PostingRequestHash:  sha256.Sum256([]byte("bare-allowance-attempt")),
+	}
+	if _, err := fixture.service.RedeemAndPost(
+		fixture.ctx, VerifiedPresentation{}, fixture.journal,
+		fixture.posting(allowance, effect),
+	); !errors.Is(err, ErrInvalidPresentation) {
+		t.Fatalf("bare allowance redemption = %v", err)
+	}
+	var transactions int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT count(*) FROM ledger_transactions WHERE transaction_id=$1`,
+		effect.LedgerTransactionID).Scan(&transactions); err != nil {
+		t.Fatal(err)
+	}
+	if transactions != 0 {
+		t.Fatalf("bare allowance created %d ledger transactions", transactions)
+	}
+	assertConservation(t, fixture, "40", "20", "20")
+}
+
+func TestValidPresentationForUnconfiguredDomainFailsAtomically(t *testing.T) {
+	fixture := newIntegrationFixture(t, 40)
+	allowance := fixture.issue(t, 20)
+	raw, err := fixture.deviceSE.present(
+		allowance, fixture.merchant, "unconfigured-domain",
+		sha256.Sum256([]byte("unconfigured-domain-challenge")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := fixture.service.VerifyPresentation(fixture.ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect := RedemptionEffect{
+		EffectID:            "domain-effect-" + allowance.AllowanceID,
+		LedgerTransactionID: "domain-tx-" + allowance.AllowanceID,
+		PostingRequestHash:  sha256.Sum256([]byte("unconfigured-domain-post")),
+	}
+	if _, err := fixture.service.RedeemAndPost(
+		fixture.ctx, verified, fixture.journal, fixture.posting(allowance, effect),
+	); err == nil {
+		t.Fatal("validly signed presentation from an unconfigured domain redeemed")
+	}
+	var transactions int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT count(*) FROM ledger_transactions WHERE transaction_id=$1`,
+		effect.LedgerTransactionID).Scan(&transactions); err != nil {
+		t.Fatal(err)
+	}
+	if transactions != 0 {
+		t.Fatalf("rejected domain left %d ledger transactions", transactions)
+	}
+	assertConservation(t, fixture, "40", "20", "20")
 }
 
 func TestOfflineRevocationRequiresDurableFenceAndReturnsOriginRight(t *testing.T) {
@@ -440,8 +555,7 @@ func TestCopiedAllowanceCannotChangeMerchantDomainOrChallenge(t *testing.T) {
 		copied := presentation
 		copied.Signature = append([]byte(nil), presentation.Signature...)
 		mutate(&copied)
-		if _, err := fixture.service.VerifyPresentation(fixture.ctx, copied);
-			!errors.Is(err, ErrInvalidPresentation) {
+		if _, err := fixture.service.VerifyPresentation(fixture.ctx, copied); !errors.Is(err, ErrInvalidPresentation) {
 			t.Fatalf("copied presentation mutation %d = %v", index, err)
 		}
 	}
@@ -474,9 +588,9 @@ func TestPresentationChallengeDedupIsPermanentAcrossAllowances(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstEffect := RedemptionEffect{
-		EffectID: "challenge-first-" + firstAllowance.AllowanceID,
+		EffectID:            "challenge-first-" + firstAllowance.AllowanceID,
 		LedgerTransactionID: "challenge-first-tx-" + firstAllowance.AllowanceID,
-		PostingRequestHash: sha256.Sum256([]byte("challenge-first-post")),
+		PostingRequestHash:  sha256.Sum256([]byte("challenge-first-post")),
 	}
 	if _, err := fixture.service.RedeemAndPost(
 		fixture.ctx, first, fixture.journal, fixture.posting(firstAllowance, firstEffect),
@@ -484,9 +598,9 @@ func TestPresentationChallengeDedupIsPermanentAcrossAllowances(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondEffect := RedemptionEffect{
-		EffectID: "challenge-second-" + secondAllowance.AllowanceID,
+		EffectID:            "challenge-second-" + secondAllowance.AllowanceID,
 		LedgerTransactionID: "challenge-second-tx-" + secondAllowance.AllowanceID,
-		PostingRequestHash: sha256.Sum256([]byte("challenge-second-post")),
+		PostingRequestHash:  sha256.Sum256([]byte("challenge-second-post")),
 	}
 	if _, err := fixture.service.RedeemAndPost(
 		fixture.ctx, second, fixture.journal, fixture.posting(secondAllowance, secondEffect),
@@ -501,7 +615,7 @@ func TestDelayedValidPresentationCannotBeTerminatedBeforeClosure(t *testing.T) {
 	allowance := fixture.issue(t, 20)
 	verified := fixture.presentation(t, allowance)
 	staleClosure, err := fixture.closure.closure(
-		fixture.domain, allowance.IssuerEpoch, allowance.Counter-1,
+		fixture.domain, allowance, allowance.Counter-1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -513,9 +627,9 @@ func TestDelayedValidPresentationCannotBeTerminatedBeforeClosure(t *testing.T) {
 	}
 	assertConservation(t, fixture, "50", "30", "20")
 	effect := RedemptionEffect{
-		EffectID: "delayed-effect-" + allowance.AllowanceID,
+		EffectID:            "delayed-effect-" + allowance.AllowanceID,
 		LedgerTransactionID: "delayed-tx-" + allowance.AllowanceID,
-		PostingRequestHash: sha256.Sum256([]byte("delayed-valid-presentation")),
+		PostingRequestHash:  sha256.Sum256([]byte("delayed-valid-presentation")),
 	}
 	if _, err := fixture.service.RedeemAndPost(
 		fixture.ctx, verified, fixture.journal, fixture.posting(allowance, effect),
@@ -529,19 +643,159 @@ func TestTerminationRequiresEveryConfiguredAcceptanceDomain(t *testing.T) {
 	fixture := newIntegrationFixture(t, 50)
 	secondClosure := newLocalEd25519(t)
 	secondClosure.keyID = "second-closure-" + integrationSuffix(t)
+	secondDomain := "second-domain-" + integrationSuffix(t)
 	if err := fixture.service.ConfigureAcceptanceDomain(fixture.ctx, AcceptanceDomain{
-		Name: "second-domain-" + integrationSuffix(t), ClosureKeyID: secondClosure.keyID,
-		FirstSettlementEpoch: 1,
+		Name: secondDomain, ClosureKeyID: secondClosure.keyID,
+		FirstSettlementEpoch: fixture.epoch, LastSettlementEpoch: fixture.epoch + 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	allowance := fixture.issue(t, 20)
-	if _, err := fixture.service.Terminate(
+	completeService := NewService(
+		fixture.runner, fixture.ids, fixture.service.signer, fixture.service.verifier,
+		fixture.service.presentationVerifier,
+		closureVerifierSet{
+			fixture.closure.keyID: fixture.closure,
+			secondClosure.keyID:   secondClosure,
+		},
+	)
+	if _, err := completeService.Terminate(
 		fixture.ctx, fixture.fenceRequest(t, allowance, fixture.closureFor(t, allowance)),
 	); !errors.Is(err, ErrIncompleteClosure) {
 		t.Fatalf("termination with one domain missing = %v", err)
 	}
 	assertConservation(t, fixture, "50", "30", "20")
+	secondEvidence, err := secondClosure.closure(
+		secondDomain, allowance, allowance.Counter,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := completeService.Terminate(fixture.ctx, fixture.fenceRequest(
+		t, allowance, fixture.closureFor(t, allowance), secondEvidence,
+	)); err != nil {
+		t.Fatalf("termination with complete independently signed domain set = %v", err)
+	}
+	assertConservation(t, fixture, "50", "50", "0")
+}
+
+func TestClosureForDifferentIssuanceNamespaceCannotReturnAuthority(t *testing.T) {
+	fixture := newIntegrationFixture(t, 60)
+	first := fixture.issue(t, 20)
+	foreignNamespace := first
+	foreignNamespace.DeviceIdentityHash = sha256.Sum256([]byte("foreign-device-namespace"))
+	if err := fixture.service.EnrollDevice(fixture.ctx, Device{
+		AccountID: fixture.accountID, AssetID: fixture.assetID,
+		OriginRegion: fixture.region, DeviceIdentityHash: foreignNamespace.DeviceIdentityHash,
+		IssuerEpoch: fixture.epoch,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The high watermark deliberately covers first.Counter. Safety must still
+	// bind to the exact device/authority namespace because counters are not global.
+	wrongEvidence, err := fixture.closure.closure(
+		fixture.domain, foreignNamespace, first.Counter+100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fixture.fenceRequest(t, first, wrongEvidence)
+	if _, err := fixture.service.Terminate(
+		fixture.ctx, request,
+	); !errors.Is(err, ErrIncompleteClosure) {
+		t.Fatalf("closure for another allowance = %v", err)
+	}
+	// Defense in depth: even a buggy runtime that bypassed the Go namespace
+	// comparison cannot manufacture a non-redemption proof directly in SQL.
+	closureSet, err := verifyClosureSet(fixture.ctx, fixture.service.closureVerifier, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := closureSet.byDomain[fixture.domain]
+	forgedProofHash := sha256.Sum256([]byte("forged-proof"))
+	proofAttempted := false
+	err = fixture.runner.RunSerializable(fixture.ctx, func(tx pgx.Tx) error {
+		if _, inner := tx.Exec(fixture.ctx, `
+INSERT INTO offline_domain_closure_evidence
+ (evidence_hash, acceptance_domain, account_id, asset_id, origin_region,
+  device_identity_hash, closed_settlement_epoch, closed_upload_fence,
+  key_id, payload_hash, canonical_payload, signature)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			value.evidenceHash[:], fixture.domain, value.closure.AccountID,
+			value.closure.AssetID, value.closure.OriginRegion,
+			value.closure.DeviceIdentityHash[:], int64(value.closure.ClosedSettlementEpoch),
+			int64(value.closure.ClosedUploadFence), value.closure.KeyID,
+			value.payloadHash[:], value.payload, value.closure.Signature); inner != nil {
+			return inner
+		}
+		if _, inner := tx.Exec(fixture.ctx, `
+INSERT INTO offline_termination_closure_links
+ (allowance_id, acceptance_domain, evidence_hash)
+VALUES ($1,$2,$3)`, first.AllowanceID, fixture.domain, value.evidenceHash[:]); inner != nil {
+			return inner
+		}
+		proofAttempted = true
+		_, inner := tx.Exec(fixture.ctx, `
+INSERT INTO offline_non_redemption_proofs
+ (allowance_id, terminal_kind, payload_hash, issuer_epoch, device_counter,
+  fence_version, policy_evidence_hash, closure_set_hash, proof_hash)
+VALUES ($1,'REVOKED',$2,$3,$4,1,$5,$6,$7)`, first.AllowanceID,
+			request.ExpectedPayloadHash[:], int64(request.ExpectedIssuerEpoch),
+			int64(request.ExpectedDeviceCounter), request.PolicyEvidenceHash[:],
+			closureSet.setHash[:], forgedProofHash[:])
+		return inner
+	})
+	if !proofAttempted || err == nil ||
+		(!strings.Contains(err.Error(), "offline termination lacks complete signed domain closure") &&
+			!strings.Contains(err.Error(), "offline termination proof does not bind terminal allowance")) {
+		t.Fatalf("database accepted cross-namespace closure: attempted=%t error=%v", proofAttempted, err)
+	}
+	assertConservation(t, fixture, "60", "40", "20")
+}
+
+func TestDevicePresentationCounterCannotBeReusedAcrossAllowances(t *testing.T) {
+	fixture := newIntegrationFixture(t, 60)
+	firstAllowance := fixture.issue(t, 20)
+	secondAllowance := fixture.issue(t, 20)
+	first := fixture.presentation(t, firstAllowance)
+	secondRaw, err := fixture.deviceSE.present(
+		secondAllowance, fixture.merchant, fixture.domain,
+		sha256.Sum256([]byte("second-counter-challenge:"+secondAllowance.AllowanceID)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw.PresentationCounter = first.presentation.PresentationCounter
+	payload, err := secondRaw.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw.Signature = ed25519.Sign(fixture.deviceSE.private, payload)
+	second, err := fixture.service.VerifyPresentation(fixture.ctx, secondRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEffect := RedemptionEffect{
+		EffectID:            "counter-first-" + firstAllowance.AllowanceID,
+		LedgerTransactionID: "counter-first-tx-" + firstAllowance.AllowanceID,
+		PostingRequestHash:  sha256.Sum256([]byte("counter-first-post")),
+	}
+	if _, err := fixture.service.RedeemAndPost(
+		fixture.ctx, first, fixture.journal, fixture.posting(firstAllowance, firstEffect),
+	); err != nil {
+		t.Fatal(err)
+	}
+	secondEffect := RedemptionEffect{
+		EffectID:            "counter-second-" + secondAllowance.AllowanceID,
+		LedgerTransactionID: "counter-second-tx-" + secondAllowance.AllowanceID,
+		PostingRequestHash:  sha256.Sum256([]byte("counter-second-post")),
+	}
+	if _, err := fixture.service.RedeemAndPost(
+		fixture.ctx, second, fixture.journal, fixture.posting(secondAllowance, secondEffect),
+	); !errors.Is(err, ErrRedemptionConflict) {
+		t.Fatalf("reused hardware presentation counter = %v", err)
+	}
+	assertConservation(t, fixture, "40", "20", "20")
 }
 
 func TestRedemptionTerminationRaceHasOneEconomicWinner(t *testing.T) {
@@ -549,9 +803,9 @@ func TestRedemptionTerminationRaceHasOneEconomicWinner(t *testing.T) {
 	allowance := fixture.issue(t, 30)
 	verified := fixture.presentation(t, allowance)
 	effect := RedemptionEffect{
-		EffectID: "race-effect-" + allowance.AllowanceID,
+		EffectID:            "race-effect-" + allowance.AllowanceID,
 		LedgerTransactionID: "race-tx-" + allowance.AllowanceID,
-		PostingRequestHash: sha256.Sum256([]byte("termination-race")),
+		PostingRequestHash:  sha256.Sum256([]byte("termination-race")),
 	}
 	termination := fixture.fenceRequest(t, allowance, fixture.closureFor(t, allowance))
 	start := make(chan struct{})
@@ -606,8 +860,7 @@ func TestHardwareVerifierOutageFailsClosed(t *testing.T) {
 		fixture.runner, fixture.ids, fixture.service.signer, fixture.service.verifier,
 		unavailablePresentationVerifier{}, unavailableClosureVerifier{},
 	)
-	if _, err := outage.VerifyPresentation(fixture.ctx, presentation);
-		!errors.Is(err, ErrVerifierUnavailable) {
+	if _, err := outage.VerifyPresentation(fixture.ctx, presentation); !errors.Is(err, ErrVerifierUnavailable) {
 		t.Fatalf("presentation verifier outage = %v", err)
 	}
 	if _, err := outage.Terminate(
@@ -639,8 +892,8 @@ func TestIssuerEpochFencesDelayedPreparedAllowance(t *testing.T) {
 	}
 	if err := fixture.service.AdvanceIssuerEpoch(fixture.ctx, Device{
 		AccountID: fixture.accountID, AssetID: fixture.assetID,
-		OriginRegion: fixture.region, DeviceIdentityHash: fixture.device, IssuerEpoch: 1,
-	}, 2); err != nil {
+		OriginRegion: fixture.region, DeviceIdentityHash: fixture.device, IssuerEpoch: fixture.epoch,
+	}, fixture.epoch+1); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fixture.service.signAndActivate(fixture.ctx, prepared); !errors.Is(err, ErrFenceConflict) {
@@ -648,10 +901,388 @@ func TestIssuerEpochFencesDelayedPreparedAllowance(t *testing.T) {
 	}
 	assertConservation(t, fixture, "20", "20", "0")
 	fresh := fixture.issue(t, 5)
-	if fresh.IssuerEpoch != 2 || fresh.Counter != 1 {
+	if fresh.IssuerEpoch != fixture.epoch+1 || fresh.Counter != 1 {
 		t.Fatalf("new fenced namespace = epoch %d counter %d", fresh.IssuerEpoch, fresh.Counter)
 	}
 	assertConservation(t, fixture, "20", "15", "5")
+}
+
+func TestVerifiedPresentationOwnsAuditBytesAfterCallerMutation(t *testing.T) {
+	fixture := newIntegrationFixture(t, 30)
+	allowance := fixture.issue(t, 20)
+	challenge := sha256.Sum256([]byte("owned-audit-bytes:" + allowance.AllowanceID))
+	raw, err := fixture.deviceSE.present(
+		allowance, fixture.merchant, fixture.domain, challenge,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := fixture.service.VerifyPresentation(fixture.ctx, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedPayload := append([]byte(nil), verified.payload...)
+	expectedPresentationSignature := append([]byte(nil), raw.Signature...)
+	expectedAllowanceSignature := append([]byte(nil), raw.Allowance.Signature...)
+	raw.Signature[0] ^= 0xff
+	raw.Allowance.Signature[0] ^= 0xff
+
+	effect := RedemptionEffect{
+		EffectID:            "owned-bytes-effect-" + allowance.AllowanceID,
+		LedgerTransactionID: "owned-bytes-tx-" + allowance.AllowanceID,
+		PostingRequestHash:  sha256.Sum256([]byte("owned-bytes-post")),
+	}
+	if _, err := fixture.service.RedeemAndPost(
+		fixture.ctx, verified, fixture.journal, fixture.posting(allowance, effect),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var storedPayload, storedPresentationSignature, storedAllowanceSignature []byte
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT receipt.presentation_payload, receipt.presentation_signature,
+       allowance.signature
+FROM offline_redemption_receipts AS receipt
+JOIN offline_allowances AS allowance USING (allowance_id)
+WHERE receipt.allowance_id=$1`, allowance.AllowanceID).Scan(
+		&storedPayload, &storedPresentationSignature, &storedAllowanceSignature); err != nil {
+		t.Fatal(err)
+	}
+	if !bytesEqual(storedPayload, expectedPayload) ||
+		!bytesEqual(storedPresentationSignature, expectedPresentationSignature) ||
+		!bytesEqual(storedAllowanceSignature, expectedAllowanceSignature) {
+		t.Fatal("caller-owned slices changed immutable financial audit bytes")
+	}
+}
+
+func TestAcceptanceDomainKeyRotationIsAppendOnlyAndEpochBound(t *testing.T) {
+	fixture := newIntegrationFixture(t, 90)
+	first := fixture.issue(t, 20)
+	oldHistorical := closureAtEpoch(
+		t, fixture.closure, fixture.domain, first, fixture.epoch, first.Counter,
+	)
+	newKey := newLocalEd25519(t)
+	newKey.keyID = "rotated-closure-" + integrationSuffix(t)
+	if err := fixture.service.RotateAcceptanceDomainKey(fixture.ctx, AcceptanceDomainKeyRotation{
+		AcceptanceDomain: fixture.domain, ExpectedKeyID: fixture.closure.keyID,
+		NewKeyID: newKey.keyID, EffectiveEpoch: fixture.epoch + 1,
+		PriorKeyReason: KeyRetired,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completeService := NewService(
+		fixture.runner, fixture.ids, fixture.service.signer, fixture.service.verifier,
+		fixture.service.presentationVerifier,
+		closureVerifierSet{fixture.closure.keyID: fixture.closure, newKey.keyID: newKey},
+	)
+	// Retirement is prospective: a closure whose signed logical watermark is
+	// inside the old window remains independently auditable and valid.
+	if _, err := completeService.Terminate(
+		fixture.ctx, fixture.fenceRequest(t, first, oldHistorical),
+	); err != nil {
+		t.Fatalf("historical closure after rotation = %v", err)
+	}
+	if err := fixture.service.AdvanceIssuerEpoch(fixture.ctx, Device{
+		AccountID: fixture.accountID, AssetID: fixture.assetID,
+		OriginRegion: fixture.region, DeviceIdentityHash: fixture.device,
+		IssuerEpoch: fixture.epoch,
+	}, fixture.epoch+1); err != nil {
+		t.Fatal(err)
+	}
+	second := fixture.issue(t, 20)
+	compromisedOld := closureAtEpoch(
+		t, fixture.closure, fixture.domain, second, fixture.epoch+1, second.Counter,
+	)
+	if _, err := completeService.Terminate(
+		fixture.ctx, fixture.fenceRequest(t, second, compromisedOld),
+	); !errors.Is(err, ErrIncompleteClosure) {
+		t.Fatalf("retired key at later epoch = %v", err)
+	}
+	newEvidence := closureAtEpoch(
+		t, newKey, fixture.domain, second, fixture.epoch+1, second.Counter,
+	)
+	if _, err := completeService.Terminate(
+		fixture.ctx, fixture.fenceRequest(t, second, newEvidence),
+	); err != nil {
+		t.Fatalf("rotated key at exact epoch = %v", err)
+	}
+
+	var activations, terminations, overlaps int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT
+ (SELECT count(*) FROM offline_acceptance_domain_key_activations
+   WHERE acceptance_domain=$1),
+ (SELECT count(*) FROM offline_acceptance_domain_key_terminations
+   WHERE acceptance_domain=$1),
+ (SELECT count(*)
+    FROM offline_acceptance_domain_key_activations AS left_key
+    JOIN offline_acceptance_domain_key_activations AS right_key
+      ON right_key.acceptance_domain=left_key.acceptance_domain
+     AND right_key.activated_epoch>left_key.activated_epoch
+    LEFT JOIN offline_acceptance_domain_key_terminations AS left_end
+      ON left_end.acceptance_domain=left_key.acceptance_domain
+     AND left_end.key_id=left_key.key_id
+   WHERE left_key.acceptance_domain=$1
+     AND (left_end.terminated_epoch IS NULL
+          OR left_end.terminated_epoch>right_key.activated_epoch))`,
+		fixture.domain).Scan(&activations, &terminations, &overlaps); err != nil {
+		t.Fatal(err)
+	}
+	if activations != 2 || terminations != 1 || overlaps != 0 {
+		t.Fatalf("key history activations=%d terminations=%d overlaps=%d",
+			activations, terminations, overlaps)
+	}
+}
+
+func TestConcurrentKeyRotationHasOneNonOverlappingWinner(t *testing.T) {
+	fixture := newIntegrationFixture(t, 10)
+	firstCandidate := "rotation-a-" + integrationSuffix(t)
+	secondCandidate := "rotation-b-" + integrationSuffix(t)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, keyID := range []string{firstCandidate, secondCandidate} {
+		keyID := keyID
+		go func() {
+			<-start
+			results <- fixture.service.RotateAcceptanceDomainKey(
+				fixture.ctx, AcceptanceDomainKeyRotation{
+					AcceptanceDomain: fixture.domain,
+					ExpectedKeyID:    fixture.closure.keyID, NewKeyID: keyID,
+					EffectiveEpoch: fixture.epoch + 1, PriorKeyReason: KeyRevoked,
+				},
+			)
+		}()
+	}
+	close(start)
+	successes, conflicts := 0, 0
+	for index := 0; index < 2; index++ {
+		err := <-results
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrKeyLifecycleConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent rotation result: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("rotation successes=%d conflicts=%d", successes, conflicts)
+	}
+	var activations, terminations int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT
+ (SELECT count(*) FROM offline_acceptance_domain_key_activations
+   WHERE acceptance_domain=$1),
+ (SELECT count(*) FROM offline_acceptance_domain_key_terminations
+   WHERE acceptance_domain=$1)`, fixture.domain).Scan(&activations, &terminations); err != nil {
+		t.Fatal(err)
+	}
+	if activations != 2 || terminations != 1 {
+		t.Fatalf("concurrent rotation history activations=%d terminations=%d",
+			activations, terminations)
+	}
+}
+
+func TestAcceptanceDomainConfigurationRoleIsExecuteOnly(t *testing.T) {
+	fixture := newIntegrationFixture(t, 10)
+	tx, err := fixture.pool.BeginTx(fixture.ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(fixture.ctx)
+	if _, err := tx.Exec(fixture.ctx, `SET LOCAL ROLE offline_configuration_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(fixture.ctx, `
+INSERT INTO offline_acceptance_domain_key_activations
+ (acceptance_domain,key_id,activated_epoch) VALUES ($1,$2,$3)`,
+		fixture.domain, "raw-key-"+integrationSuffix(t), int64(fixture.epoch+1)); !isOfflinePermissionDenied(err) {
+		t.Fatalf("raw key activation error=%v, want SQLSTATE 42501", err)
+	}
+	// A permission error aborts the SQL transaction; use a fresh one for the
+	// guarded operation.
+	_ = tx.Rollback(fixture.ctx)
+	tx, err = fixture.pool.BeginTx(fixture.ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(fixture.ctx)
+	if _, err := tx.Exec(fixture.ctx, `SET LOCAL ROLE offline_configuration_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	newKeyID := "control-plane-key-" + integrationSuffix(t)
+	var changed bool
+	if err := tx.QueryRow(fixture.ctx, `
+SELECT public.rotate_offline_acceptance_domain_key($1,$2,$3,$4,'RETIRED')`,
+		fixture.domain, fixture.closure.keyID, newKeyID,
+		int64(fixture.epoch+1)).Scan(&changed); err != nil || !changed {
+		t.Fatalf("guarded key rotation changed=%t err=%v", changed, err)
+	}
+	if err := tx.Commit(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOfflineRuntimeCannotRawMintOrBypassCoherentProcedures(t *testing.T) {
+	fixture := newIntegrationFixture(t, 40)
+	allowance := fixture.issue(t, 10)
+	before, err := fixture.service.Snapshot(fixture.ctx, fixture.accountID, fixture.assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, statement := range map[string]string{
+		"coherent authority mint": `UPDATE escrow_authorities SET total_authority=total_authority+100, unallocated=unallocated+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
+		"raw total authority":    `UPDATE escrow_authorities SET total_authority=total_authority+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
+		"raw regional authority": `UPDATE escrow_regional_rights SET available=available+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
+		"raw allowance":          `UPDATE offline_allowances SET state='REDEEMED', redeemed_at=transaction_timestamp() WHERE allowance_id='` + allowance.AllowanceID + `'`,
+		"raw proof":              `INSERT INTO offline_non_redemption_proofs (allowance_id,terminal_kind,payload_hash,issuer_epoch,device_counter,fence_version,policy_evidence_hash,closure_set_hash,proof_hash) SELECT allowance_id,'REVOKED',payload_hash,issuer_epoch,device_counter,1,payload_hash,payload_hash,payload_hash FROM offline_allowances WHERE allowance_id='` + allowance.AllowanceID + `'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tx, err := fixture.pool.BeginTx(fixture.ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(fixture.ctx)
+			if _, err := tx.Exec(fixture.ctx, `SET LOCAL ROLE offline_runtime`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(fixture.ctx, statement); !isOfflinePermissionDenied(err) {
+				t.Fatalf("raw authority error=%v, want SQLSTATE 42501", err)
+			}
+		})
+	}
+	// EXECUTE is also not an arbitrary mint primitive: without an immutable
+	// prepared allowance it cannot move any financial bucket.
+	tx, err := fixture.pool.BeginTx(fixture.ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(fixture.ctx, `SET LOCAL ROLE offline_runtime`); err != nil {
+		_ = tx.Rollback(fixture.ctx)
+		t.Fatal(err)
+	}
+	var changed bool
+	err = tx.QueryRow(fixture.ctx, `
+SELECT public.activate_offline_allowance($1,$2,$3)`,
+		"nonexistent-"+allowance.AllowanceID, make([]byte, 32), []byte("not-an-hsm-proof")).Scan(&changed)
+	_ = tx.Rollback(fixture.ctx)
+	if err == nil || isOfflinePermissionDenied(err) {
+		t.Fatalf("unlinked activation error=%v; expected guarded procedure rejection", err)
+	}
+	after, err := fixture.service.Snapshot(fixture.ctx, fixture.accountID, fixture.assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.TotalAuthority.Cmp(after.TotalAuthority) != 0 ||
+		before.Regional.Cmp(after.Regional) != 0 ||
+		before.OfflineIssued.Cmp(after.OfflineIssued) != 0 || !after.Conserved() {
+		t.Fatalf("denied coherent-mint attempts changed authority: before=%#v after=%#v",
+			before, after)
+	}
+}
+
+func TestNarrowProceduresRejectKeyAndAllowanceFenceSubstitution(t *testing.T) {
+	fixture := newIntegrationFixture(t, 40)
+	allowance := fixture.issue(t, 10)
+	before, err := fixture.service.Snapshot(fixture.ctx, fixture.accountID, fixture.assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var counterBefore int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT last_counter FROM offline_device_counters
+WHERE account_id=$1 AND asset_id=$2 AND origin_region=$3
+  AND device_identity_hash=$4`, fixture.accountID, fixture.assetID,
+		fixture.region, fixture.device[:]).Scan(&counterBefore); err != nil {
+		t.Fatal(err)
+	}
+	var changed bool
+	err = fixture.pool.QueryRow(fixture.ctx, `
+SELECT public.prepare_offline_allowance($1,$2,$3,$4,$5,$6,$7)`,
+		allowance.AllowanceID, allowance.AccountID, allowance.AssetID,
+		allowance.OriginRegion, allowance.DeviceIdentityHash[:],
+		allowance.Amount.String(), "substituted-issuer-key").Scan(&changed)
+	if err != nil || changed {
+		t.Fatalf("existing allowance retry after key rotation changed=%t error=%v", changed, err)
+	}
+	var storedKey string
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT key_id FROM offline_allowances WHERE allowance_id=$1`,
+		allowance.AllowanceID).Scan(&storedKey); err != nil {
+		t.Fatal(err)
+	}
+	if storedKey != allowance.KeyID {
+		t.Fatalf("idempotent retry replaced stored issuer key %q with %q",
+			allowance.KeyID, storedKey)
+	}
+	payloadHash, err := allowance.PayloadHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyHash := sha256.Sum256([]byte("substituted-policy"))
+	closureSetHash := sha256.Sum256([]byte("substituted-closure-set"))
+	var fence int64
+	err = fixture.pool.QueryRow(fixture.ctx, `
+SELECT public.terminate_offline_allowance($1,$2,$3,$4,$5,$6,$7)`,
+		allowance.AllowanceID, string(Revoked), payloadHash[:],
+		int64(allowance.IssuerEpoch+1), int64(allowance.Counter),
+		policyHash[:], closureSetHash[:]).Scan(&fence)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "allowance mismatch") {
+		t.Fatalf("termination issuer-epoch substitution error=%v", err)
+	}
+	var state string
+	var counterAfter int64
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+SELECT allowance.state, device.last_counter
+FROM offline_allowances AS allowance
+JOIN offline_device_counters AS device
+  ON device.account_id=allowance.account_id
+ AND device.asset_id=allowance.asset_id
+ AND device.origin_region=allowance.origin_region
+ AND device.device_identity_hash=allowance.device_identity_hash
+WHERE allowance.allowance_id=$1`, allowance.AllowanceID).Scan(&state, &counterAfter); err != nil {
+		t.Fatal(err)
+	}
+	after, err := fixture.service.Snapshot(fixture.ctx, fixture.accountID, fixture.assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != stateIssued || counterAfter != counterBefore || !after.Conserved() ||
+		before.TotalAuthority.Cmp(after.TotalAuthority) != 0 ||
+		before.Regional.Cmp(after.Regional) != 0 ||
+		before.OfflineIssued.Cmp(after.OfflineIssued) != 0 {
+		t.Fatalf("substitution changed facts: state=%s counter=%d/%d before=%#v after=%#v",
+			state, counterBefore, counterAfter, before, after)
+	}
+}
+
+func closureAtEpoch(
+	t *testing.T,
+	signer *localEd25519,
+	domain string,
+	allowance Allowance,
+	epoch, fence uint64,
+) DomainClosure {
+	t.Helper()
+	closure := DomainClosure{
+		Version: ClosureVersion, AcceptanceDomain: domain,
+		AccountID: allowance.AccountID, AssetID: allowance.AssetID,
+		OriginRegion:          allowance.OriginRegion,
+		DeviceIdentityHash:    allowance.DeviceIdentityHash,
+		ClosedSettlementEpoch: epoch, ClosedUploadFence: fence,
+		KeyID: signer.keyID,
+	}
+	payload, err := closure.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure.Signature = ed25519.Sign(signer.private, payload)
+	return closure
+}
+
+func isOfflinePermissionDenied(err error) bool {
+	var databaseError *pgconn.PgError
+	return err != nil && errors.As(err, &databaseError) && databaseError.Code == "42501"
 }
 
 func (f *integrationFixture) posting(allowance Allowance, effect RedemptionEffect) ledger.PostRequest {
@@ -687,6 +1318,22 @@ func integrationSuffix(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return hex.EncodeToString(value[:])
+}
+
+func integrationEpoch(t *testing.T) uint64 {
+	t.Helper()
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		t.Fatal(err)
+	}
+	epoch := binary.BigEndian.Uint64(value[:]) & uint64(math.MaxInt64)
+	if epoch == 0 {
+		epoch = 1
+	}
+	if epoch == uint64(math.MaxInt64) {
+		epoch--
+	}
+	return epoch
 }
 
 func bytesEqual(left, right []byte) bool {

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/example/payment-platform/internal/ledger"
 	"github.com/jackc/pgx/v5"
@@ -16,6 +17,7 @@ import (
 var (
 	ErrCheckpointRace     = errors.New("audit: checkpoint predecessor changed; recompute and resign")
 	ErrCheckpointConflict = errors.New("audit: checkpoint key already contains different evidence")
+	ErrCheckpointEvidence = errors.New("audit: stored checkpoint does not match verified journal evidence")
 )
 
 type Checkpoint struct {
@@ -28,6 +30,7 @@ type Checkpoint struct {
 	PreviousCheckpointRoot *[32]byte
 	Signature              []byte
 	SigningKeyID           string
+	CreatedAt              time.Time
 }
 
 // CheckpointSigner is implemented in production by an HSM/KMS signing API.
@@ -95,6 +98,12 @@ func (c Checkpointer) Create(ctx context.Context, bookID string, first, last int
 	if len(checkpoint.Signature) == 0 {
 		return Checkpoint{}, errors.New("audit: signer returned an empty signature")
 	}
+	// Fail closed before making an immutable row durable. A broken or
+	// misconfigured remote signer must not permanently poison the checkpoint
+	// chain with evidence that cannot be verified.
+	if err := c.Verify(ctx, checkpoint); err != nil {
+		return Checkpoint{}, err
+	}
 
 	tx, err := c.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -143,6 +152,10 @@ ON CONFLICT (book_id,last_sequence) DO NOTHING`, checkpoint.BookID,
 	if err := tx.Commit(ctx); err != nil {
 		return Checkpoint{}, err
 	}
+	checkpoint, err = loadCheckpoint(ctx, c.DB, bookID, last)
+	if err != nil {
+		return Checkpoint{}, err
+	}
 	if err := c.Verify(ctx, checkpoint); err != nil {
 		return Checkpoint{}, err
 	}
@@ -159,6 +172,54 @@ func (c Checkpointer) Verify(ctx context.Context, checkpoint Checkpoint) error {
 	}
 	if err := c.Signer.Verify(ctx, checkpoint.SigningKeyID, payload, checkpoint.Signature); err != nil {
 		return fmt.Errorf("audit: invalid checkpoint signature: %w", err)
+	}
+	return nil
+}
+
+// VerifyStored replays the exact persisted closed range, including canonical
+// metadata bytes and the ledger hash chain, before a checkpoint is exported.
+// This is intentionally repeated after a crash: a durable checkpoint receipt
+// alone never causes unverified bytes to be copied to WORM.
+func (c Checkpointer) VerifyStored(ctx context.Context, checkpoint Checkpoint) error {
+	if c.DB == nil {
+		return errors.New("audit: checkpoint database is required")
+	}
+	if err := c.Verify(ctx, checkpoint); err != nil {
+		return err
+	}
+	var expectedPrevious [32]byte
+	if checkpoint.FirstSequence == 1 {
+		if checkpoint.PreviousCheckpointRoot != nil {
+			return ErrCheckpointEvidence
+		}
+		expectedPrevious = ledger.GenesisHash(checkpoint.BookID)
+	} else {
+		previous, err := loadCheckpoint(ctx, c.DB, checkpoint.BookID, checkpoint.FirstSequence-1)
+		if err != nil {
+			return fmt.Errorf("%w: predecessor: %v", ErrCheckpointEvidence, err)
+		}
+		if checkpoint.PreviousCheckpointRoot == nil ||
+			*checkpoint.PreviousCheckpointRoot != previous.MerkleRoot {
+			return ErrCheckpointEvidence
+		}
+		expectedPrevious = previous.LastEntryHash
+	}
+	requested := Range{
+		BookID: checkpoint.BookID, First: checkpoint.FirstSequence,
+		Last: checkpoint.LastSequence, ExpectedPrev: expectedPrevious,
+	}
+	transactions, err := (SQLReader{DB: c.DB}).LoadRange(ctx, requested)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrCheckpointEvidence, err)
+	}
+	verified, err := VerifyRange(requested, transactions)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrCheckpointEvidence, err)
+	}
+	if int64(verified.Count) != checkpoint.LeafCount ||
+		verified.Merkle != checkpoint.MerkleRoot ||
+		verified.LastHash != checkpoint.LastEntryHash {
+		return ErrCheckpointEvidence
 	}
 	return nil
 }
@@ -230,10 +291,12 @@ func loadCheckpoint(ctx context.Context, query checkpointQuerier, bookID string,
 	var root, entry, previous []byte
 	err := query.QueryRow(ctx, `
 SELECT book_id, first_sequence, last_sequence, leaf_count, merkle_root,
-       last_entry_hash, previous_checkpoint_root, signature, signing_key_id
+       last_entry_hash, previous_checkpoint_root, signature, signing_key_id,
+       created_at
 FROM audit.merkle_checkpoints WHERE book_id=$1 AND last_sequence=$2`, bookID, last).Scan(
 		&result.BookID, &result.FirstSequence, &result.LastSequence, &result.LeafCount,
-		&root, &entry, &previous, &result.Signature, &result.SigningKeyID)
+		&root, &entry, &previous, &result.Signature, &result.SigningKeyID,
+		&result.CreatedAt)
 	if err != nil {
 		return Checkpoint{}, err
 	}

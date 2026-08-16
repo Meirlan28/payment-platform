@@ -42,6 +42,7 @@ const (
 	JournalSequenceGap        SeverityCategory = "JOURNAL_SEQUENCE_GAP"
 	EscrowNotConserved        SeverityCategory = "ESCROW_NOT_CONSERVED"
 	PaymentAggregateMismatch  SeverityCategory = "PAYMENT_AGGREGATE_MISMATCH"
+	PaymentCaptureMismatch    SeverityCategory = "PAYMENT_CAPTURE_MISMATCH"
 	PaymentEffectWithoutProof SeverityCategory = "PAYMENT_EFFECT_WITHOUT_POSTED_LEDGER"
 	RefundOverCapture         SeverityCategory = "REFUND_OVER_CAPTURE"
 	CashbackRuleExceeded      SeverityCategory = "CASHBACK_RULE_EXCEEDED"
@@ -292,21 +293,34 @@ WITH folded AS (
          coalesce(sum(CASE WHEN e.effect_kind='HOLD' THEN e.amount_atoms ELSE 0 END),0) AS authorized,
          coalesce(sum(CASE WHEN e.effect_kind='CAPTURE' THEN e.amount_atoms ELSE 0 END),0) AS captured,
          coalesce(sum(CASE WHEN e.effect_kind='RELEASE' THEN e.amount_atoms
-                           WHEN e.effect_kind='REVERSAL' AND original.effect_kind='HOLD'
+                           WHEN e.effect_kind='REVERSAL' AND EXISTS (
+                                SELECT 1 FROM payment_effects AS original
+                                 WHERE original.payment_id=e.payment_id
+                                   AND original.effect_kind='HOLD'
+                                   AND original.ledger_transaction_id=e.original_transaction_id)
                            THEN e.amount_atoms ELSE 0 END),0) AS released,
          coalesce(sum(CASE WHEN e.effect_kind='REFUND' THEN e.amount_atoms ELSE 0 END),0) AS refunded,
          coalesce(sum(CASE WHEN e.effect_kind='CHARGEBACK' THEN e.amount_atoms ELSE 0 END),0) AS charged_back,
          coalesce(sum(CASE WHEN e.effect_kind='FEE' THEN e.amount_atoms ELSE 0 END),0) AS fee,
          coalesce(sum(CASE WHEN e.effect_kind='TAX' THEN e.amount_atoms ELSE 0 END),0) AS tax,
-         coalesce(sum(CASE WHEN e.effect_kind='CASHBACK' THEN e.amount_atoms ELSE 0 END),0) AS cashback
+         coalesce(sum(CASE WHEN e.effect_kind='CASHBACK' THEN e.amount_atoms ELSE 0 END),0) AS cashback_gross,
+         coalesce(sum(CASE WHEN e.effect_kind='REVERSAL' AND 1=(
+                                SELECT count(*)
+                                  FROM payment_effects AS cashback
+                                  JOIN payment_capture_financials AS capture
+                                    ON capture.payment_id=cashback.payment_id
+                                   AND capture.capture_transaction_id=cashback.original_transaction_id
+                                 WHERE cashback.payment_id=e.payment_id
+                                   AND cashback.effect_kind='CASHBACK'
+                                   AND cashback.ledger_transaction_id=e.original_transaction_id)
+                           THEN e.amount_atoms ELSE 0 END),0) AS cashback_reversed
     FROM payment_operations AS p
     LEFT JOIN payment_effects AS e ON e.payment_id=p.payment_id
-    LEFT JOIN payment_effects AS original
-      ON original.payment_id=e.payment_id
-     AND original.ledger_transaction_id=e.original_transaction_id
    GROUP BY p.payment_id, p.asset_id
-), reversed AS (
-  SELECT payment_id, coalesce(sum(cashback_reversed_atoms),0) AS cashback_reversed
+), capture_fold AS (
+  SELECT payment_id,
+         coalesce(sum(expected_cashback_atoms),0) AS expected_cashback,
+         coalesce(sum(cashback_reversed_atoms),0) AS cashback_reversed
     FROM payment_capture_financials GROUP BY payment_id
 )
 SELECT p.payment_id, p.asset_id,
@@ -317,25 +331,29 @@ SELECT p.payment_id, p.asset_id,
        p.charged_back_atoms::STRING, f.charged_back::STRING,
        p.fee_atoms::STRING, f.fee::STRING,
        p.tax_atoms::STRING, f.tax::STRING,
-       p.cashback_atoms::STRING, f.cashback::STRING,
-       p.cashback_reversed_atoms::STRING, coalesce(r.cashback_reversed,0)::STRING
+       p.cashback_atoms::STRING, coalesce(c.expected_cashback,0)::STRING,
+       p.cashback_reversed_atoms::STRING, coalesce(c.cashback_reversed,0)::STRING,
+       f.cashback_gross::STRING, f.cashback_reversed::STRING,
+       (f.cashback_gross-f.cashback_reversed)::STRING
   FROM payment_operations AS p
   JOIN folded AS f USING (payment_id, asset_id)
-  LEFT JOIN reversed AS r USING (payment_id)
+  LEFT JOIN capture_fold AS c USING (payment_id)
  WHERE p.authorized_atoms <> f.authorized
     OR p.captured_atoms <> f.captured
     OR p.released_atoms <> f.released
     OR p.refunded_atoms <> f.refunded
     OR p.charged_back_atoms <> f.charged_back
     OR p.fee_atoms <> f.fee OR p.tax_atoms <> f.tax
-    OR p.cashback_atoms <> f.cashback
-    OR p.cashback_reversed_atoms <> coalesce(r.cashback_reversed,0)`)
+    OR p.cashback_atoms <> coalesce(c.expected_cashback,0)
+    OR p.cashback_reversed_atoms <> coalesce(c.cashback_reversed,0)
+    OR p.cashback_reversed_atoms <> f.cashback_reversed
+    OR f.cashback_gross-f.cashback_reversed <> coalesce(c.expected_cashback,0)`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var payment, asset string
-		values := make([]string, 18)
+		values := make([]string, 21)
 		destinations := []any{&payment, &asset}
 		for index := range values {
 			destinations = append(destinations, &values[index])
@@ -348,8 +366,9 @@ SELECT p.payment_id, p.asset_id,
 		labels := []string{"authorized_stored", "authorized_folded", "captured_stored", "captured_folded",
 			"released_stored", "released_folded", "refunded_stored", "refunded_folded",
 			"charged_back_stored", "charged_back_folded", "fee_stored", "fee_folded",
-			"tax_stored", "tax_folded", "cashback_stored", "cashback_folded",
-			"cashback_reversed_stored", "cashback_reversed_folded"}
+			"tax_stored", "tax_folded", "cashback_expected_stored", "cashback_expected_folded",
+			"cashback_reversed_stored", "cashback_reversed_folded",
+			"cashback_effect_gross", "cashback_effect_reversed", "cashback_effect_net"}
 		for index, label := range labels {
 			details[label] = values[index]
 		}
@@ -363,6 +382,9 @@ SELECT p.payment_id, p.asset_id,
 		return err
 	}
 	rows.Close()
+	if err := c.checkPaymentCaptureFinancials(ctx, tx, report); err != nil {
+		return err
+	}
 
 	rows, err = tx.Query(ctx, `
 SELECT e.payment_effect_id, p.asset_id
@@ -394,14 +416,18 @@ WHERE t.transaction_id IS NULL OR t.status <> 'POSTED'`)
 WITH cashback_facts AS (
   SELECT p.payment_id, p.asset_id, p.cashback_rule_atoms,
          coalesce(sum(CASE WHEN e.effect_kind='CASHBACK' THEN e.amount_atoms ELSE 0 END),0)
-         - coalesce(sum(CASE WHEN e.effect_kind='REVERSAL' AND original.effect_kind='CASHBACK'
+         - coalesce(sum(CASE WHEN e.effect_kind='REVERSAL' AND 1=(
+                                  SELECT count(*)
+                                    FROM payment_effects AS cashback
+                                    JOIN payment_capture_financials AS capture
+                                      ON capture.payment_id=cashback.payment_id
+                                     AND capture.capture_transaction_id=cashback.original_transaction_id
+                                   WHERE cashback.payment_id=e.payment_id
+                                     AND cashback.effect_kind='CASHBACK'
+                                     AND cashback.ledger_transaction_id=e.original_transaction_id)
                              THEN e.amount_atoms ELSE 0 END),0) AS net_cashback
   FROM payment_operations AS p
   LEFT JOIN payment_effects AS e ON e.payment_id=p.payment_id
-  LEFT JOIN payment_effects AS original
-    ON original.payment_id=p.payment_id
-   AND original.ledger_transaction_id=e.original_transaction_id
-   AND original.effect_kind='CASHBACK'
   GROUP BY p.payment_id, p.asset_id, p.cashback_rule_atoms
 )
 SELECT payment_id, asset_id, (net_cashback-cashback_rule_atoms)::STRING
@@ -418,6 +444,195 @@ WHERE net_cashback > cashback_rule_atoms`)
 		}
 		if err := report.add(CashbackRuleExceeded, SeverityP0, "", payment, asset, excess,
 			map[string]string{"payment_id": payment}); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// checkPaymentCaptureFinancials proves the per-capture projection rather than
+// only comparing payment-wide totals. Without this check two capture rows can
+// exchange a refund/chargeback counter while leaving every aggregate equal.
+// Only posted effects with an exact immutable reference are eligible. A
+// cashback reversal is attributed through the linked CASHBACK effect and that
+// effect's capture reference; an unrelated REVERSAL can therefore never mask
+// a duplicate grant.
+func (c *Checker) checkPaymentCaptureFinancials(ctx context.Context, tx pgx.Tx, report *Report) error {
+	rows, err := tx.Query(ctx, `
+WITH posted_effects AS (
+  SELECT effect.payment_id, effect.payment_effect_id, effect.effect_kind,
+         effect.amount_atoms, effect.ledger_transaction_id,
+         effect.original_transaction_id
+    FROM payment_effects AS effect
+    JOIN ledger_transactions AS journal
+      ON journal.transaction_id=effect.ledger_transaction_id
+     AND journal.effect_id=effect.payment_effect_id
+     AND journal.status='POSTED'
+), captures AS (
+  SELECT payment_id, payment_effect_id, amount_atoms, ledger_transaction_id
+    FROM posted_effects WHERE effect_kind='CAPTURE'
+), capture_projections AS (
+  SELECT coalesce(financial.payment_id, capture.payment_id) AS payment_id,
+         coalesce(financial.capture_transaction_id,
+                  capture.ledger_transaction_id) AS capture_transaction_id,
+         financial.capture_transaction_id IS NOT NULL AS financial_present,
+         capture.ledger_transaction_id IS NOT NULL AS posted_capture_present,
+         financial.capture_effect_id AS stored_effect_id,
+         capture.payment_effect_id AS posted_effect_id,
+         financial.captured_atoms AS stored_captured,
+         capture.amount_atoms AS posted_captured,
+         financial.expected_cashback_atoms AS expected_cashback,
+         financial.refunded_atoms AS stored_refunded,
+         financial.charged_back_atoms AS stored_charged_back,
+         financial.cashback_reversed_atoms AS stored_cashback_reversed
+    FROM payment_capture_financials AS financial
+    FULL OUTER JOIN captures AS capture
+      ON capture.payment_id=financial.payment_id
+     AND capture.ledger_transaction_id=financial.capture_transaction_id
+), folded AS (
+  SELECT projection.*,
+         coalesce((
+           SELECT sum(effect.amount_atoms) FROM posted_effects AS effect
+            WHERE effect.payment_id=projection.payment_id
+              AND effect.effect_kind='REFUND'
+              AND effect.original_transaction_id=projection.capture_transaction_id
+         ),0) AS folded_refunded,
+         coalesce((
+           SELECT sum(effect.amount_atoms) FROM posted_effects AS effect
+            WHERE effect.payment_id=projection.payment_id
+              AND effect.effect_kind='CHARGEBACK'
+              AND effect.original_transaction_id=projection.capture_transaction_id
+         ),0) AS folded_charged_back,
+         coalesce((
+           SELECT sum(effect.amount_atoms) FROM posted_effects AS effect
+            WHERE effect.payment_id=projection.payment_id
+              AND effect.effect_kind='CASHBACK'
+              AND effect.original_transaction_id=projection.capture_transaction_id
+         ),0) AS gross_cashback,
+         coalesce((
+           SELECT sum(reversal.amount_atoms)
+             FROM posted_effects AS reversal
+            WHERE reversal.payment_id=projection.payment_id
+              AND reversal.effect_kind='REVERSAL'
+              AND 1=(SELECT count(*) FROM posted_effects AS candidate
+                      JOIN payment_capture_financials AS candidate_capture
+                        ON candidate_capture.payment_id=candidate.payment_id
+                       AND candidate_capture.capture_transaction_id=candidate.original_transaction_id
+                     WHERE candidate.payment_id=reversal.payment_id
+                       AND candidate.effect_kind='CASHBACK'
+                       AND candidate.ledger_transaction_id=reversal.original_transaction_id)
+              AND EXISTS (
+                    SELECT 1 FROM posted_effects AS cashback
+                     WHERE cashback.payment_id=reversal.payment_id
+                       AND cashback.effect_kind='CASHBACK'
+                       AND cashback.ledger_transaction_id=reversal.original_transaction_id
+                       AND cashback.original_transaction_id=projection.capture_transaction_id)
+         ),0) AS folded_cashback_reversed
+    FROM capture_projections AS projection
+)
+SELECT folded.payment_id, folded.capture_transaction_id, payment.asset_id,
+       folded.financial_present, folded.posted_capture_present,
+       coalesce(folded.stored_effect_id,''), coalesce(folded.posted_effect_id,''),
+       coalesce(folded.stored_captured,0)::STRING,
+       coalesce(folded.posted_captured,0)::STRING,
+       coalesce(folded.stored_refunded,0)::STRING,
+       folded.folded_refunded::STRING,
+       coalesce(folded.stored_charged_back,0)::STRING,
+       folded.folded_charged_back::STRING,
+       coalesce(folded.expected_cashback,0)::STRING,
+       folded.gross_cashback::STRING,
+       coalesce(folded.stored_cashback_reversed,0)::STRING,
+       folded.folded_cashback_reversed::STRING,
+       (folded.gross_cashback-folded.folded_cashback_reversed)::STRING
+  FROM folded
+  LEFT JOIN payment_operations AS payment ON payment.payment_id=folded.payment_id
+ WHERE NOT folded.financial_present OR NOT folded.posted_capture_present
+    OR folded.stored_effect_id IS DISTINCT FROM folded.posted_effect_id
+    OR folded.stored_captured IS DISTINCT FROM folded.posted_captured
+    OR folded.stored_refunded IS DISTINCT FROM folded.folded_refunded
+    OR folded.stored_charged_back IS DISTINCT FROM folded.folded_charged_back
+    OR folded.stored_cashback_reversed IS DISTINCT FROM folded.folded_cashback_reversed
+    OR folded.gross_cashback-folded.folded_cashback_reversed
+       IS DISTINCT FROM folded.expected_cashback`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var paymentID, captureTransactionID, assetID string
+		var financialPresent, postedCapturePresent bool
+		values := make([]string, 13)
+		destinations := []any{&paymentID, &captureTransactionID, &assetID,
+			&financialPresent, &postedCapturePresent}
+		for index := range values {
+			destinations = append(destinations, &values[index])
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			rows.Close()
+			return err
+		}
+		details := map[string]string{
+			"payment_id":             paymentID,
+			"capture_transaction_id": captureTransactionID,
+			"financial_present":      fmt.Sprintf("%t", financialPresent),
+			"posted_capture_present": fmt.Sprintf("%t", postedCapturePresent),
+		}
+		labels := []string{"capture_effect_stored", "capture_effect_posted",
+			"captured_stored", "captured_posted", "refunded_stored", "refunded_folded",
+			"charged_back_stored", "charged_back_folded", "cashback_expected",
+			"cashback_gross", "cashback_reversed_stored", "cashback_reversed_folded",
+			"cashback_net"}
+		for index, label := range labels {
+			details[label] = values[index]
+		}
+		if err := report.add(PaymentCaptureMismatch, SeverityP0, "",
+			captureTransactionID, assetID, "0", details); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	rows, err = tx.Query(ctx, `
+SELECT reversal.payment_effect_id, reversal.payment_id, payment.asset_id,
+       reversal.original_transaction_id
+  FROM payment_effects AS reversal
+  JOIN payment_operations AS payment ON payment.payment_id=reversal.payment_id
+  JOIN ledger_transactions AS journal
+    ON journal.transaction_id=reversal.ledger_transaction_id
+   AND journal.effect_id=reversal.payment_effect_id
+   AND journal.status='POSTED'
+ WHERE reversal.effect_kind='REVERSAL'
+   AND ((SELECT count(*) FROM payment_effects AS hold
+          WHERE hold.payment_id=reversal.payment_id
+            AND hold.effect_kind='HOLD'
+            AND hold.ledger_transaction_id=reversal.original_transaction_id)
+        +(SELECT count(*)
+            FROM payment_effects AS cashback
+            JOIN payment_capture_financials AS capture
+              ON capture.payment_id=cashback.payment_id
+             AND capture.capture_transaction_id=cashback.original_transaction_id
+           WHERE cashback.payment_id=reversal.payment_id
+             AND cashback.effect_kind='CASHBACK'
+             AND cashback.ledger_transaction_id=reversal.original_transaction_id))<>1`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var effectID, paymentID, assetID, originalTransactionID string
+		if err := rows.Scan(&effectID, &paymentID, &assetID, &originalTransactionID); err != nil {
+			return err
+		}
+		if err := report.add(PaymentCaptureMismatch, SeverityP0, "", effectID,
+			assetID, "0", map[string]string{
+				"payment_id":              paymentID,
+				"original_transaction_id": originalTransactionID,
+				"reason":                  "reversal is not linked to one hold or capture cashback fact",
+			}); err != nil {
 			return err
 		}
 	}

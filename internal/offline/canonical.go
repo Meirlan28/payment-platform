@@ -7,14 +7,14 @@ import (
 )
 
 const (
-	allowanceDomain = "payment-platform/offline-allowance/v1\x00"
-	effectDomain    = "payment-platform/offline-redemption-effect/v1\x00"
-	proofDomain     = "payment-platform/offline-non-redemption-proof/v1\x00"
-	presentationDomain = "payment-platform/offline-presentation/v1\x00"
+	allowanceDomain            = "payment-platform/offline-allowance/v1\x00"
+	effectDomain               = "payment-platform/offline-redemption-effect/v1\x00"
+	proofDomain                = "payment-platform/offline-non-redemption-proof/v1\x00"
+	presentationDomain         = "payment-platform/offline-presentation/v1\x00"
 	presentationEnvelopeDomain = "payment-platform/offline-presentation-envelope/v1\x00"
-	closureDomain = "payment-platform/offline-acceptance-domain-closure/v1\x00"
-	closureEvidenceDomain = "payment-platform/offline-closure-evidence/v1\x00"
-	closureSetDomain = "payment-platform/offline-closure-set/v1\x00"
+	closureDomain              = "payment-platform/offline-acceptance-domain-closure/v1\x00"
+	closureEvidenceDomain      = "payment-platform/offline-closure-evidence/v1\x00"
+	closureSetDomain           = "payment-platform/offline-closure-set/v1\x00"
 )
 
 // CanonicalPayload is the sole representation accepted by signers and
@@ -94,6 +94,10 @@ func (c DomainClosure) CanonicalPayload() ([]byte, error) {
 	out := append([]byte(nil), closureDomain...)
 	out = appendUint16(out, c.Version)
 	out = appendString(out, c.AcceptanceDomain)
+	for _, value := range []string{c.AccountID, c.AssetID, c.OriginRegion} {
+		out = appendString(out, value)
+	}
+	out = append(out, c.DeviceIdentityHash[:]...)
 	out = appendUint64(out, c.ClosedSettlementEpoch)
 	out = appendUint64(out, c.ClosedUploadFence)
 	out = appendString(out, c.KeyID)

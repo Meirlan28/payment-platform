@@ -141,6 +141,18 @@ Certificate содержит source/destination authority, asset, amount atoms, 
 
 Offline allowance является таким же отдельным escrow bucket: его issuance атомарно уменьшает regional right. Ни устройство, ни merchant не могут выпустить allowance самостоятельно; aggregate issued allowances входят в global escrow conservation check.
 
+Online redemption принимает не bearer allowance, а opaque результат проверки
+secure-element presentation. Подпись presentation связывает exact allowance,
+merchant account, acceptance domain, неповторимый merchant challenge и
+аппаратный monotonic counter; receipt и эти dedup-ключи сохраняются навсегда.
+Возврат неиспользованного authority разрешён только по независимо подписанным
+closure watermark от каждого domain, причём каждый closure связан с конкретным
+issuance namespace `(account, asset, origin, device)` и утверждает
+fencing будущего acceptance до `(epoch,counter)`. Поэтому watermark можно
+безопасно переиспользовать для более ранних allowances одного namespace, но
+нельзя применить к независимому per-device counter; отсутствие receipt или
+wall-clock expiry доказательством не является.
+
 ### 4.4 `saga-service`
 
 Saga state, steps, attempts, compensation state и worker generation находятся в CockroachDB. Worker получает lease/fence, но каждый side effect дополнительно защищён effect ID; lease сам по себе не обеспечивает exactly-once.

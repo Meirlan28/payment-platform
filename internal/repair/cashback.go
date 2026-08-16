@@ -314,14 +314,6 @@ FROM payment_operations WHERE payment_id=$1 FOR UPDATE`, manifest.PaymentID).
 			return err
 		}
 
-		if authorityRegion != "" {
-			if _, err := escrow.SpendInTx(ctx, tx, escrow.EffectRequest{
-				EffectID: manifest.CorrectionEffectID, AccountID: availableAccountID,
-				AssetID: manifest.AssetID, Region: authorityRegion, Amount: manifest.Excess,
-			}); err != nil {
-				return err
-			}
-		}
 		metadata, _ := json.Marshal(map[string]string{
 			"repair_id": repairID, "reason": "duplicate_cashback",
 			"original_transaction_id": manifest.OriginalTransactionID,
@@ -353,6 +345,14 @@ VALUES ($1,$2,'REVERSAL',$3,$4,$5)`, manifest.CorrectionEffectID,
 			manifest.OriginalTransactionID)
 		if err != nil {
 			return err
+		}
+		if authorityRegion != "" {
+			if _, err := escrow.CashbackRepairSpendInTx(ctx, tx, repairID, escrow.EffectRequest{
+				EffectID: manifest.CorrectionEffectID, AccountID: availableAccountID,
+				AssetID: manifest.AssetID, Region: authorityRegion, Amount: manifest.Excess,
+			}); err != nil {
+				return err
+			}
 		}
 		tag, err := tx.Exec(ctx, `
 UPDATE payment_capture_financials

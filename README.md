@@ -6,7 +6,10 @@ ledger в CockroachDB 26.2 `SERIALIZABLE`/Raft; Kafka 4.3 KRaft переноси
 at-least-once, но не определяет баланс. Код и тесты реализуют idempotency,
 payment lifecycle, escrow, offline allowances, FX, saga/external `UNKNOWN`,
 refund/chargeback/reversal, reconciliation, PII separation, audit/Merkle,
-schema cutover и controlled cashback repair.
+schema cutover и controlled cashback repair. Production path также
+фиксирует canonical ledger bytes для DB-side hash verification,
+проверяет secure-element offline presentations и разделяет
+runtime database capabilities по workload identities.
 
 Это не заявление о готовности обслуживать 2 млн ops/s. Локальный benchmark на
 одном laptop с plaintext RF3 не подтверждает production RF7/Q4 capacity,
@@ -17,7 +20,9 @@ schema cutover и controlled cashback repair.
 ## Архитектурный контракт
 
 - Денежный commit — только balanced `POSTED` transaction и durable receipt из
-  CockroachDB. Materialized balance является проверяемой проекцией journal.
+  CockroachDB. Перед posting DB восстанавливает framing из
+  persisted header/canonical metadata/ordered lines и проверяет transaction
+  hash; materialized balance является проверяемой проекцией journal.
 - Каждая mutation имеет scope `(mTLS principal, RPC, idempotency key)`, canonical
   payload hash и stable operation/effect IDs. Timeout не означает abort.
 - API: `Authorize`, `Capture`, `Release`, `Reversal`, `Refund`, `Chargeback`,
@@ -75,8 +80,9 @@ make test-chaos
 make test
 ```
 
-`make test-integration` запускает tagged Cockroach/Kafka tests под `internal`.
-Отдельный end-to-end тест reference migration сейчас запускается явно:
+`make test-integration` запускает tagged Cockroach/Kafka tests для
+schema migrator, `internal/...` и end-to-end reference migration. Последний
+можно повторить изолированно:
 
 ```bash
 docker compose run --rm go-toolchain \
@@ -126,6 +132,7 @@ make down
 make generate
 docker build --target runtime -t payment-api:local .
 docker build --target publisher -t outbox-publisher:local .
+docker build --target reconciliation -t reconciliation-worker:local .
 docker build --target reference-migration -t reference-migration:local .
 docker build --target migrator -t schema-migrator:local .
 ```
@@ -145,9 +152,10 @@ backend egress и trust bootstrap должен заменить environment rele
   locality labels, TLS, PDB/anti-affinity; zone policy RF7/Q4 задаётся bootstrap.
 - `deploy/kubernetes/kafka`: Strimzi Kafka 4.3.1 KRaft, 7 controllers, 12 brokers,
   TLS/mTLS/SCRAM, topic RF7/MISR4, unclean election disabled.
-- `deploy/kubernetes`: payment API и outbox publisher, mTLS certificates,
-  least-privilege identities, OTel sidecars, PDB, topology spread, default-deny
-  NetworkPolicy и Prometheus financial alerts.
+- `deploy/kubernetes`: payment API, outbox publisher и reconciliation worker,
+  mTLS certificates, per-workload least-privilege database identities, OTel
+  sidecars, PDB, topology spread, default-deny NetworkPolicy и Prometheus
+  financial alerts.
 - `deploy/vault`: seven-voter Vault Enterprise Raft, TLS, HSM/PKCS#11 auto-unseal,
   retained data/audit PVC и secret references.
 - `deploy/otel`: mTLS gateway, privacy processors, bounded queues и monitoring.
@@ -155,6 +163,9 @@ backend egress и trust bootstrap должен заменить environment rele
 Прямо применять base manifests нельзя. Первый deployment, database identity
 bootstrap, Kafka topic sizing, migration Jobs, schema cutover и rollback gates
 даны пошагово в [operations.md](docs/operations.md).
+Production migration Job требует exact checked-in target filename; migrator
+пишет durable receipt для каждого DDL statement и не делает
+автоматический replay после ambiguous outcome.
 
 ## Что измерено, а что нет
 
@@ -170,9 +181,12 @@ bootstrap, Kafka topic sizing, migration Jobs, schema cutover и rollback gates
   [benchmarks/results-local.md](benchmarks/results-local.md).
 
 Это результаты конкретных завершённых запусков, а не «зелёный статус навсегда».
-После последних authorization/escrow API hardening полный tagged integration
-run ещё не зафиксирован как PASS в этом документе; до повторного `make test` и
-отдельного `tests/integration` release gate закрыт.
+Release verification для текущего hardening на 2026-08-16: **PENDING**.
+Пока не зафиксированы свежий full race/integration run, clean-database
+migration через все gates, no-op checksum replay и manifest validation,
+release gate остаётся закрыт. Этот абзац не является отчётом о
+пройденных проверках и должен быть заменён фактическим evidence
+перед release.
 
 Сохранённый smoke benchmark (100 attempts/case) показал приблизительно 3.884
 successful posts/s для одного book/одного worker, 1.248 posts/s и 53% exhausted

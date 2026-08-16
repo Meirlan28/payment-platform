@@ -207,3 +207,62 @@ spec:
   issuerRef:
     name: workload-vault-pki
     kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: audit-checkpointer-cockroach-client
+  namespace: payments
+spec:
+  secretName: audit-checkpointer-cockroach-client-tls
+  duration: 24h
+  renewBefore: 8h
+  commonName: audit_checkpointer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  issuerRef:
+    name: cockroach-client-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: audit-checkpointer-vault-client
+  namespace: payments
+spec:
+  secretName: audit-checkpointer-vault-client-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  uris:
+    - spiffe://payments.example/service/audit-checkpointer
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: audit-checkpointer-otel-client
+  namespace: payments
+spec:
+  secretName: audit-checkpointer-otel-client-tls
+  duration: 24h
+  renewBefore: 8h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages: [client auth]
+  uris:
+    - spiffe://payments.example/service/audit-checkpointer-telemetry
+  issuerRef:
+    name: workload-vault-pki
+    kind: Issuer

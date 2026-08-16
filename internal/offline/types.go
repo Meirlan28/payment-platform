@@ -38,6 +38,7 @@ var (
 	ErrDeviceConflict        = errors.New("offline: device enrollment or issuer epoch conflict")
 	ErrCounterExhausted      = errors.New("offline: device counter exhausted")
 	ErrConservationViolation = errors.New("offline: escrow authority conservation violation")
+	ErrKeyLifecycleConflict  = errors.New("offline: acceptance-domain key lifecycle conflict")
 )
 
 // Signer is implemented by a production HSM/KMS adapter. Sign receives a key
@@ -144,6 +145,7 @@ func (a Allowance) ValidatePayload() error {
 // verifier before entering a transaction shared with ledger.PostInTx.
 type VerifiedAllowance struct {
 	allowance   Allowance
+	payload     []byte
 	payloadHash [32]byte
 }
 
@@ -155,17 +157,17 @@ func (v VerifiedAllowance) AllowanceID() string { return v.allowance.AllowanceID
 // logical counters copied from the signed allowance (IssuerEpoch and Counter);
 // neither is a wall-clock timestamp.
 type Presentation struct {
-	Version              uint16   `json:"version"`
+	Version              uint16    `json:"version"`
 	Allowance            Allowance `json:"allowance"`
-	AllowancePayloadHash [32]byte `json:"allowance_payload_hash"`
-	MerchantAccountID    string   `json:"merchant_account_id"`
-	AcceptanceDomain     string   `json:"acceptance_domain"`
-	MerchantChallenge    [32]byte `json:"merchant_challenge"`
-	SettlementEpoch      uint64   `json:"settlement_epoch"`
-	UploadFence          uint64   `json:"upload_fence"`
-	PresentationCounter  uint64   `json:"presentation_counter"`
-	DeviceKeyID          string   `json:"device_key_id"`
-	Signature            []byte   `json:"signature"`
+	AllowancePayloadHash [32]byte  `json:"allowance_payload_hash"`
+	MerchantAccountID    string    `json:"merchant_account_id"`
+	AcceptanceDomain     string    `json:"acceptance_domain"`
+	MerchantChallenge    [32]byte  `json:"merchant_challenge"`
+	SettlementEpoch      uint64    `json:"settlement_epoch"`
+	UploadFence          uint64    `json:"upload_fence"`
+	PresentationCounter  uint64    `json:"presentation_counter"`
+	DeviceKeyID          string    `json:"device_key_id"`
+	Signature            []byte    `json:"signature"`
 }
 
 func (p Presentation) ValidatePayload() error {
@@ -186,11 +188,11 @@ func (p Presentation) ValidatePayload() error {
 // copied bearer allowance without secure-element verification.
 type VerifiedPresentation struct {
 	presentation     Presentation
-	allowance         VerifiedAllowance
-	payload           []byte
-	payloadHash       [32]byte
-	presentationHash  [32]byte
-	challengeHash     [32]byte
+	allowance        VerifiedAllowance
+	payload          []byte
+	payloadHash      [32]byte
+	presentationHash [32]byte
+	challengeHash    [32]byte
 }
 
 func (v VerifiedPresentation) AllowanceID() string {
@@ -264,6 +266,52 @@ type AcceptanceDomain struct {
 	LastSettlementEpoch  uint64 // zero means no configured upper bound
 }
 
+type KeyTerminationReason string
+
+const (
+	KeyRetired KeyTerminationReason = "RETIRED"
+	KeyRevoked KeyTerminationReason = "REVOKED"
+)
+
+// AcceptanceDomainKeyRotation is an append-only compare-and-swap. The prior
+// key is valid strictly before EffectiveEpoch and the new key from that epoch.
+type AcceptanceDomainKeyRotation struct {
+	AcceptanceDomain string
+	ExpectedKeyID    string
+	NewKeyID         string
+	EffectiveEpoch   uint64
+	PriorKeyReason   KeyTerminationReason
+}
+
+func (r AcceptanceDomainKeyRotation) validate() error {
+	if !validText(r.AcceptanceDomain) || !validText(r.ExpectedKeyID) ||
+		!validText(r.NewKeyID) || r.ExpectedKeyID == r.NewKeyID ||
+		r.EffectiveEpoch == 0 || r.EffectiveEpoch > math.MaxInt64 ||
+		(r.PriorKeyReason != KeyRetired && r.PriorKeyReason != KeyRevoked) {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
+// AcceptanceDomainKeyTermination retires or revokes a key without replacement.
+// Later logical epochs fail closed until a separately controlled domain/key
+// configuration is introduced; historical epochs remain verifiable.
+type AcceptanceDomainKeyTermination struct {
+	AcceptanceDomain string
+	ExpectedKeyID    string
+	EffectiveEpoch   uint64
+	Reason           KeyTerminationReason
+}
+
+func (r AcceptanceDomainKeyTermination) validate() error {
+	if !validText(r.AcceptanceDomain) || !validText(r.ExpectedKeyID) ||
+		r.EffectiveEpoch == 0 || r.EffectiveEpoch > math.MaxInt64 ||
+		(r.Reason != KeyRetired && r.Reason != KeyRevoked) {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
 func (d AcceptanceDomain) validate() error {
 	if !validText(d.Name) || !validText(d.ClosureKeyID) ||
 		d.FirstSettlementEpoch == 0 || d.FirstSettlementEpoch > math.MaxInt64 ||
@@ -275,12 +323,19 @@ func (d AcceptanceDomain) validate() error {
 }
 
 // DomainClosure is signed independently by an acceptance domain after that
-// domain has durably ingested or rejected every presentation at or below the
-// logical (settlement epoch, upload fence) watermark. Times are deliberately
-// absent from the correctness payload.
+// domain has durably ingested or rejected every presentation in the exact
+// account/asset/origin/device issuance namespace at or below the logical
+// (settlement epoch, upload fence) watermark and has fenced future acceptance.
+// The namespace binding prevents a watermark from crossing independent device
+// counters while allowing safe reuse for earlier allowances in one namespace.
+// Times are deliberately absent from the correctness payload.
 type DomainClosure struct {
 	Version               uint16   `json:"version"`
 	AcceptanceDomain      string   `json:"acceptance_domain"`
+	AccountID             string   `json:"account_id"`
+	AssetID               string   `json:"asset_id"`
+	OriginRegion          string   `json:"origin_region"`
+	DeviceIdentityHash    [32]byte `json:"device_identity_hash"`
 	ClosedSettlementEpoch uint64   `json:"closed_settlement_epoch"`
 	ClosedUploadFence     uint64   `json:"closed_upload_fence"`
 	KeyID                 string   `json:"key_id"`
@@ -289,6 +344,8 @@ type DomainClosure struct {
 
 func (c DomainClosure) ValidatePayload() error {
 	if c.Version != ClosureVersion || !validText(c.AcceptanceDomain) ||
+		!validText(c.AccountID) || !validText(c.AssetID) || !validText(c.OriginRegion) ||
+		c.DeviceIdentityHash == ([32]byte{}) ||
 		c.ClosedSettlementEpoch == 0 || c.ClosedSettlementEpoch > math.MaxInt64 ||
 		c.ClosedUploadFence > math.MaxInt64 || !validText(c.KeyID) {
 		return ErrInvalidArgument
@@ -297,9 +354,9 @@ func (c DomainClosure) ValidatePayload() error {
 }
 
 type verifiedClosure struct {
-	closure     DomainClosure
-	payload     []byte
-	payloadHash [32]byte
+	closure      DomainClosure
+	payload      []byte
+	payloadHash  [32]byte
 	evidenceHash [32]byte
 }
 

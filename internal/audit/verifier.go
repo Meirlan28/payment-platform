@@ -14,10 +14,11 @@ import (
 const MaxVerificationRange = 100_000
 
 var (
-	ErrSequenceGap  = errors.New("audit: journal sequence gap")
-	ErrPreviousHash = errors.New("audit: previous hash mismatch")
-	ErrEntryHash    = errors.New("audit: entry hash mismatch")
-	ErrHeadMismatch = errors.New("audit: book head mismatch")
+	ErrSequenceGap       = errors.New("audit: journal sequence gap")
+	ErrPreviousHash      = errors.New("audit: previous hash mismatch")
+	ErrEntryHash         = errors.New("audit: entry hash mismatch")
+	ErrHeadMismatch      = errors.New("audit: book head mismatch")
+	ErrCanonicalMetadata = errors.New("audit: persisted canonical metadata mismatch")
 )
 
 type Range struct {
@@ -51,7 +52,8 @@ func (r SQLReader) LoadRange(ctx context.Context, requested Range) ([]ledger.Tra
 		SELECT t.transaction_id, t.book_id, t.operation_id, t.effect_id,
 		       t.transaction_kind, t.reference_transaction_id,
 		       t.posting_rule_version, t.schema_version, t.request_hash,
-		       t.metadata, t.sequence_no, t.prev_hash, t.entry_hash, t.status,
+		       t.metadata, t.canonical_metadata, t.sequence_no, t.prev_hash,
+		       t.entry_hash, t.status,
 		       l.line_no, l.account_id, l.asset_id, l.side, l.amount_atoms, l.memo
 		FROM ledger_transactions AS t
 		JOIN ledger_lines AS l ON l.transaction_id = t.transaction_id
@@ -72,12 +74,13 @@ func (r SQLReader) LoadRange(ctx context.Context, requested Range) ([]ledger.Tra
 			schemaVersion, sequenceNo, lineNo                       int64
 			amountText                                              string
 			requestHash, previousHash, entryHash                    []byte
-			metadata                                                []byte
+			metadata, canonicalMetadata                             []byte
 			accountID, assetID, side, memo                          string
 		)
 		if err := rows.Scan(
 			&txID, &bookID, &operationID, &effectID, &kind, &reference,
-			&rule, &schemaVersion, &requestHash, &metadata, &sequenceNo,
+			&rule, &schemaVersion, &requestHash, &metadata,
+			&canonicalMetadata, &sequenceNo,
 			&previousHash, &entryHash, &status, &lineNo, &accountID,
 			&assetID, &side, &amountText, &memo,
 		); err != nil {
@@ -85,6 +88,10 @@ func (r SQLReader) LoadRange(ctx context.Context, requested Range) ([]ledger.Tra
 		}
 		if len(requestHash) != sha256.Size || len(previousHash) != sha256.Size || len(entryHash) != sha256.Size {
 			return nil, errors.New("audit: malformed persisted digest")
+		}
+		verifiedMetadata, err := verifiedCanonicalMetadata(metadata, canonicalMetadata)
+		if err != nil {
+			return nil, fmt.Errorf("%w: transaction=%s: %v", ErrCanonicalMetadata, txID, err)
 		}
 		if current == nil || current.TransactionID != txID {
 			var requestDigest, previousDigest, entryDigest [32]byte
@@ -96,7 +103,7 @@ func (r SQLReader) LoadRange(ctx context.Context, requested Range) ([]ledger.Tra
 					TransactionID: txID, BookID: bookID, OperationID: operationID,
 					EffectID: effectID, Kind: kind, ReferenceTransactionID: reference,
 					PostingRuleVersion: rule, SchemaVersion: schemaVersion,
-					RequestHash: requestDigest, Metadata: metadata,
+					RequestHash: requestDigest, Metadata: verifiedMetadata,
 				},
 				SequenceNo: sequenceNo, PrevHash: previousDigest,
 				EntryHash: entryDigest, Status: status,
@@ -119,6 +126,32 @@ func (r SQLReader) LoadRange(ctx context.Context, requested Range) ([]ledger.Tra
 		return nil, err
 	}
 	return transactions, nil
+}
+
+// verifiedCanonicalMetadata binds the verifier to the exact canonical bytes
+// persisted by the expanded writer. JSONB semantic equality alone would not
+// detect replacement with a different byte serialization. Legacy rows from
+// before migration 017 have no byte column and retain the v1 canonicalization
+// path.
+func verifiedCanonicalMetadata(storedJSON, canonical []byte) ([]byte, error) {
+	fromStored, err := ledger.CanonicalJSON(storedJSON)
+	if err != nil {
+		return nil, fmt.Errorf("invalid metadata JSON: %w", err)
+	}
+	if canonical == nil {
+		return fromStored, nil
+	}
+	canonicalized, err := ledger.CanonicalJSON(canonical)
+	if err != nil {
+		return nil, fmt.Errorf("invalid canonical metadata JSON: %w", err)
+	}
+	if !bytes.Equal(canonical, canonicalized) {
+		return nil, errors.New("canonical metadata is not byte-canonical")
+	}
+	if !bytes.Equal(fromStored, canonical) {
+		return nil, errors.New("canonical metadata does not represent metadata")
+	}
+	return append([]byte(nil), canonical...), nil
 }
 
 func VerifyRange(requested Range, transactions []ledger.Transaction) (Verification, error) {

@@ -12,14 +12,16 @@ import (
 func TestReconciliationMetricsComeFromDurableReport(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := NewReconciliationMetrics(registry)
-	metrics.Observe(reconciliation.Report{
+	if err := metrics.Observe(reconciliation.Report{
 		Status: "FAILED", Watermarks: map[string]int64{"book-a": 41},
 		Findings: []reconciliation.Finding{{
 			Category: reconciliation.EscrowNotConserved,
 			Severity: reconciliation.SeverityP0,
 			Amount:   ledger.NewAmountInt64(7),
 		}},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if value := gaugeValue(t, metrics.LatestSafe); value != 0 {
 		t.Fatalf("unsafe report exported as safe: %v", value)
 	}
@@ -28,6 +30,15 @@ func TestReconciliationMetricsComeFromDurableReport(t *testing.T) {
 	}
 	if value := gaugeValue(t, metrics.VerifiedWatermark.WithLabelValues("book-a")); value != 41 {
 		t.Fatalf("wrong verified watermark: %v", value)
+	}
+}
+
+func TestFinancialAndReconciliationCollectorsHaveNoDuplicateMetricNames(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	NewFinancialMetrics(registry)
+	NewReconciliationMetrics(registry)
+	if _, err := registry.Gather(); err != nil {
+		t.Fatal(err)
 	}
 }
 

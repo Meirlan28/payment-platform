@@ -22,6 +22,7 @@ import (
 	"github.com/example/payment-platform/internal/idempotency"
 	"github.com/example/payment-platform/internal/idgen"
 	"github.com/example/payment-platform/internal/ledger"
+	"github.com/example/payment-platform/internal/observability"
 	"github.com/example/payment-platform/internal/payment"
 	"github.com/example/payment-platform/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -104,6 +105,8 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	registry := prometheus.NewRegistry()
+	financialMetrics := observability.NewFinancialMetrics(registry)
 
 	tlsConfig, err := serverTLS(configuration)
 	if err != nil {
@@ -128,12 +131,12 @@ func run(logger *slog.Logger) error {
 		Payments: payments, RegionID: configuration.regionID,
 		ResolvePrincipal:  grpcapi.SPIFFEPrincipal,
 		AuthorizeAccounts: authorizer,
+		ErrorObserver:     financialMetrics,
 	})
 	healthServer := health.NewServer()
 	healthv1.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
 
-	registry := prometheus.NewRegistry()
 	metricsServer := newMetricsServer(configuration.metricsAddress, pool, registry)
 	errorsChannel := make(chan error, 2)
 	go func() {

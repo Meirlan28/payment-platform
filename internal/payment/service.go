@@ -166,16 +166,24 @@ func (s *Service) Hold(ctx context.Context, request HoldRequest) (Receipt, error
 
 	return s.execute(ctx, request.Scope+"/hold", request.IdempotencyKey, hash, "payment.held",
 		func(ctx context.Context, tx pgx.Tx, ids executionIDs) (Receipt, error) {
-			if request.AuthorityRegion != "" {
-				if _, err := escrow.SpendInTx(ctx, tx, escrow.EffectRequest{
-					EffectID: ids.EffectID, AccountID: request.CustomerAvailableAccountID,
-					AssetID: request.AssetID, Region: request.AuthorityRegion, Amount: request.Amount,
-				}); err != nil {
-					return Receipt{}, err
-				}
+			// Persist the exact account/scope intent before finalizing the DRAFT.
+			// The payment-specific DB finalizer binds the journal template to this
+			// row; both still commit or roll back in this SERIALIZABLE transaction.
+			_, err = tx.Exec(ctx, `
+INSERT INTO payment_operations (
+    payment_id, idempotency_scope, idempotency_key, asset_id,
+    customer_available_account_id, customer_held_account_id,
+    merchant_account_id, authority_region, state, authorized_atoms, cashback_rule_atoms
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'HELD', $9, $10)`,
+				paymentID, request.Scope+"/hold", request.IdempotencyKey, request.AssetID,
+				request.CustomerAvailableAccountID, request.CustomerHeldAccountID,
+				request.MerchantAccountID, nullableString(request.AuthorityRegion),
+				request.Amount.String(), request.CashbackRuleMaximum.String())
+			if err != nil {
+				return Receipt{}, err
 			}
 			metadata, _ := json.Marshal(map[string]string{"payment_id": paymentID, "hold_id": holdID})
-			journalReceipt, err := s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
+			journalReceipt, err := s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
 				TransactionID:      ids.TransactionID,
 				BookID:             request.BookID,
 				OperationID:        ids.OperationID,
@@ -194,27 +202,23 @@ func (s *Service) Hold(ctx context.Context, request HoldRequest) (Receipt, error
 				return Receipt{}, err
 			}
 			_, err = tx.Exec(ctx, `
-INSERT INTO payment_operations (
-    payment_id, idempotency_scope, idempotency_key, asset_id,
-    customer_available_account_id, customer_held_account_id,
-    merchant_account_id, authority_region, state, authorized_atoms, cashback_rule_atoms
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'HELD', $9, $10)`,
-				paymentID, request.Scope+"/hold", request.IdempotencyKey, request.AssetID,
-				request.CustomerAvailableAccountID, request.CustomerHeldAccountID,
-				request.MerchantAccountID, nullableString(request.AuthorityRegion),
-				request.Amount.String(), request.CashbackRuleMaximum.String())
-			if err != nil {
-				return Receipt{}, err
-			}
-			_, err = tx.Exec(ctx, `
 INSERT INTO holds (
     hold_id, payment_id, authorization_transaction_id, authorization_atoms
 ) VALUES ($1, $2, $3, $4)`, holdID, paymentID, journalReceipt.TransactionID, request.Amount.String())
 			if err != nil {
 				return Receipt{}, err
 			}
-			if err := insertPaymentEffect(ctx, tx, ids.EffectID, paymentID, "HOLD", request.Amount, journalReceipt.TransactionID, nil); err != nil {
+			if err := recordPaymentEffect(ctx, tx, ids.EffectID, paymentID, "HOLD",
+				request.Amount, journalReceipt.TransactionID, nil, nil, hash); err != nil {
 				return Receipt{}, err
+			}
+			if request.AuthorityRegion != "" {
+				if _, err := escrow.PaymentSpendInTx(ctx, tx, escrow.EffectRequest{
+					EffectID: ids.EffectID, AccountID: request.CustomerAvailableAccountID,
+					AssetID: request.AssetID, Region: request.AuthorityRegion, Amount: request.Amount,
+				}); err != nil {
+					return Receipt{}, err
+				}
 			}
 			return Receipt{PaymentID: paymentID, State: Held, Amount: request.Amount, Version: 0, Ledger: journalReceipt}, nil
 		})
@@ -286,7 +290,7 @@ func (s *Service) Capture(ctx context.Context, request CaptureRequest) (Receipt,
 			}
 			metadata, _ := json.Marshal(map[string]string{"payment_id": request.PaymentID})
 			reference := current.AuthorizationTransactionID
-			journalReceipt, err := s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
+			journalReceipt, err := s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
 				TransactionID: ids.TransactionID, BookID: request.BookID,
 				OperationID: ids.OperationID, EffectID: ids.EffectID, Kind: "CAPTURE",
 				ReferenceTransactionID: &reference,
@@ -297,36 +301,6 @@ func (s *Service) Capture(ctx context.Context, request CaptureRequest) (Receipt,
 				return Receipt{}, err
 			}
 			var cashbackReceipt ledger.Receipt
-			if request.Cashback.Sign() > 0 {
-				captureReference := journalReceipt.TransactionID
-				cashbackReceipt, err = s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
-					TransactionID:          ids.TransactionID + ":cashback",
-					BookID:                 request.BookID,
-					OperationID:            ids.OperationID + ":cashback",
-					EffectID:               ids.EffectID + ":cashback",
-					Kind:                   "CASHBACK",
-					ReferenceTransactionID: &captureReference,
-					PostingRuleVersion:     request.PostingRuleVersion,
-					SchemaVersion:          1,
-					RequestHash:            hash,
-					Metadata:               metadata,
-					Lines: []ledger.Line{
-						{AccountID: request.CashbackExpenseAccountID, AssetID: current.AssetID, Side: ledger.Debit, AmountAtoms: request.Cashback, Memo: "cashback expense"},
-						{AccountID: current.AvailableAccountID, AssetID: current.AssetID, Side: ledger.Credit, AmountAtoms: request.Cashback, Memo: "cashback payable"},
-					},
-				})
-				if err != nil {
-					return Receipt{}, err
-				}
-				if current.AuthorityRegion != "" {
-					if _, err := escrow.ReturnInTx(ctx, tx, escrow.EffectRequest{
-						EffectID: ids.EffectID + ":cashback", AccountID: current.AvailableAccountID,
-						AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Cashback,
-					}); err != nil {
-						return Receipt{}, err
-					}
-				}
-			}
 			holdState := "PARTIALLY_CAPTURED"
 			if newState == Captured {
 				holdState = "CAPTURED"
@@ -354,33 +328,62 @@ WHERE payment_id=$1`, request.PaymentID, newCaptured.String(), newFee.String(),
 				newTax.String(), newCashback.String(), string(newState)); err != nil {
 				return Receipt{}, err
 			}
-			if err := insertPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, "CAPTURE", request.Amount, journalReceipt.TransactionID, &reference); err != nil {
+			// CAPTURE and its immutable calculated cashback authority are one DB
+			// transition. The payment-wide cashback rule remains only the ceiling.
+			if err := recordPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID,
+				"CAPTURE", request.Amount, journalReceipt.TransactionID, &reference,
+				&request.Cashback, hash); err != nil {
 				return Receipt{}, err
 			}
-			// This is the immutable calculated cashback result for this capture.
-			// CashbackRule on the payment remains only an authorization-time
-			// aggregate ceiling and must never be used as repair ground truth.
-			if _, err = tx.Exec(ctx, `
-INSERT INTO payment_capture_financials (
-    capture_transaction_id, payment_id, capture_effect_id, captured_atoms,
-    expected_cashback_atoms
-) VALUES ($1,$2,$3,$4,$5)`, journalReceipt.TransactionID, request.PaymentID,
-				ids.EffectID, request.Amount.String(), request.Cashback.String()); err != nil {
-				return Receipt{}, err
+			if request.Cashback.Sign() > 0 {
+				captureReference := journalReceipt.TransactionID
+				cashbackReceipt, err = s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
+					TransactionID:          ids.TransactionID + ":cashback",
+					BookID:                 request.BookID,
+					OperationID:            ids.OperationID + ":cashback",
+					EffectID:               ids.EffectID + ":cashback",
+					Kind:                   "CASHBACK",
+					ReferenceTransactionID: &captureReference,
+					PostingRuleVersion:     request.PostingRuleVersion,
+					SchemaVersion:          1,
+					RequestHash:            hash,
+					Metadata:               metadata,
+					Lines: []ledger.Line{
+						{AccountID: request.CashbackExpenseAccountID, AssetID: current.AssetID, Side: ledger.Debit, AmountAtoms: request.Cashback, Memo: "cashback expense"},
+						{AccountID: current.AvailableAccountID, AssetID: current.AssetID, Side: ledger.Credit, AmountAtoms: request.Cashback, Memo: "cashback payable"},
+					},
+				})
+				if err != nil {
+					return Receipt{}, err
+				}
 			}
 			if request.Fee.Sign() > 0 {
-				if err := insertPaymentEffect(ctx, tx, ids.EffectID+":fee", request.PaymentID, "FEE", request.Fee, journalReceipt.TransactionID, &journalReceipt.TransactionID); err != nil {
+				if err := recordPaymentEffect(ctx, tx, ids.EffectID+":fee", request.PaymentID,
+					"FEE", request.Fee, journalReceipt.TransactionID,
+					&journalReceipt.TransactionID, nil, hash); err != nil {
 					return Receipt{}, err
 				}
 			}
 			if request.Tax.Sign() > 0 {
-				if err := insertPaymentEffect(ctx, tx, ids.EffectID+":tax", request.PaymentID, "TAX", request.Tax, journalReceipt.TransactionID, &journalReceipt.TransactionID); err != nil {
+				if err := recordPaymentEffect(ctx, tx, ids.EffectID+":tax", request.PaymentID,
+					"TAX", request.Tax, journalReceipt.TransactionID,
+					&journalReceipt.TransactionID, nil, hash); err != nil {
 					return Receipt{}, err
 				}
 			}
 			if request.Cashback.Sign() > 0 {
-				if err := insertPaymentEffect(ctx, tx, ids.EffectID+":cashback", request.PaymentID, "CASHBACK", request.Cashback, cashbackReceipt.TransactionID, &journalReceipt.TransactionID); err != nil {
+				if err := recordPaymentEffect(ctx, tx, ids.EffectID+":cashback", request.PaymentID,
+					"CASHBACK", request.Cashback, cashbackReceipt.TransactionID,
+					&journalReceipt.TransactionID, nil, hash); err != nil {
 					return Receipt{}, err
+				}
+				if current.AuthorityRegion != "" {
+					if _, err := escrow.PaymentReturnInTx(ctx, tx, escrow.EffectRequest{
+						EffectID: ids.EffectID + ":cashback", AccountID: current.AvailableAccountID,
+						AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Cashback,
+					}); err != nil {
+						return Receipt{}, err
+					}
 				}
 			}
 			return Receipt{PaymentID: request.PaymentID, State: newState, Amount: request.Amount, Version: newVersion, Ledger: journalReceipt}, nil
@@ -445,17 +448,9 @@ func (s *Service) release(ctx context.Context, request ReleaseRequest, reversal 
 			} else if current.Captured.Sign() > 0 {
 				newState, holdState = PartiallyCaptured, "PARTIALLY_CAPTURED"
 			}
-			if current.AuthorityRegion != "" {
-				if _, err := escrow.ReturnInTx(ctx, tx, escrow.EffectRequest{
-					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
-					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
-				}); err != nil {
-					return Receipt{}, err
-				}
-			}
 			reference := current.AuthorizationTransactionID
 			metadata, _ := json.Marshal(map[string]string{"payment_id": request.PaymentID})
-			journalReceipt, err := s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
+			journalReceipt, err := s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
 				TransactionID: ids.TransactionID, BookID: request.BookID,
 				OperationID: ids.OperationID, EffectID: ids.EffectID, Kind: kind,
 				ReferenceTransactionID: &reference,
@@ -482,8 +477,17 @@ UPDATE payment_operations SET released_atoms=$2, state=$3, version=version+1,
 WHERE payment_id=$1`, request.PaymentID, newReleased.String(), string(newState)); err != nil {
 				return Receipt{}, err
 			}
-			if err := insertPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, kind, request.Amount, journalReceipt.TransactionID, &reference); err != nil {
+			if err := recordPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, kind,
+				request.Amount, journalReceipt.TransactionID, &reference, nil, hash); err != nil {
 				return Receipt{}, err
+			}
+			if current.AuthorityRegion != "" {
+				if _, err := escrow.PaymentReturnInTx(ctx, tx, escrow.EffectRequest{
+					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
+					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
+				}); err != nil {
+					return Receipt{}, err
+				}
 			}
 			return Receipt{PaymentID: request.PaymentID, State: newState, Amount: request.Amount, Version: newVersion, Ledger: journalReceipt}, nil
 		})
@@ -524,17 +528,9 @@ func (s *Service) Refund(ctx context.Context, request RefundRequest) (Receipt, e
 			if err != nil {
 				return Receipt{}, err
 			}
-			if current.AuthorityRegion != "" {
-				if _, err := escrow.ReturnInTx(ctx, tx, escrow.EffectRequest{
-					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
-					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
-				}); err != nil {
-					return Receipt{}, err
-				}
-			}
 			reference := request.OriginalCaptureTransactionID
 			metadata, _ := json.Marshal(map[string]string{"payment_id": request.PaymentID})
-			journalReceipt, err := s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
+			journalReceipt, err := s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
 				TransactionID: ids.TransactionID, BookID: request.BookID,
 				OperationID: ids.OperationID, EffectID: ids.EffectID, Kind: "REFUND",
 				ReferenceTransactionID: &reference,
@@ -563,8 +559,17 @@ WHERE payment_id=$1 AND version=$5
 			if tag.RowsAffected() != 1 {
 				return Receipt{}, fmt.Errorf("%w: payment return projection CAS failed", ErrInvalidTransition)
 			}
-			if err := insertPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, "REFUND", request.Amount, journalReceipt.TransactionID, &reference); err != nil {
+			if err := recordPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, "REFUND",
+				request.Amount, journalReceipt.TransactionID, &reference, nil, hash); err != nil {
 				return Receipt{}, err
+			}
+			if current.AuthorityRegion != "" {
+				if _, err := escrow.PaymentReturnInTx(ctx, tx, escrow.EffectRequest{
+					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
+					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
+				}); err != nil {
+					return Receipt{}, err
+				}
 			}
 			return Receipt{PaymentID: request.PaymentID, State: newState, Amount: request.Amount, Version: newVersion, Ledger: journalReceipt}, nil
 		})
@@ -605,17 +610,9 @@ func (s *Service) Chargeback(ctx context.Context, request ChargebackRequest) (Re
 			if err != nil {
 				return Receipt{}, err
 			}
-			if current.AuthorityRegion != "" {
-				if _, err := escrow.ReturnInTx(ctx, tx, escrow.EffectRequest{
-					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
-					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
-				}); err != nil {
-					return Receipt{}, err
-				}
-			}
 			reference := request.OriginalCaptureTransactionID
 			metadata, _ := json.Marshal(map[string]string{"payment_id": request.PaymentID})
-			journalReceipt, err := s.ledger.PostInTx(ctx, tx, ledger.PostRequest{
+			journalReceipt, err := s.ledger.PreparePaymentInTx(ctx, tx, ledger.PostRequest{
 				TransactionID: ids.TransactionID, BookID: request.BookID,
 				OperationID: ids.OperationID, EffectID: ids.EffectID, Kind: "CHARGEBACK",
 				ReferenceTransactionID: &reference,
@@ -645,8 +642,17 @@ WHERE payment_id=$1 AND version=$5
 				return Receipt{}, fmt.Errorf("%w: payment return projection CAS failed", ErrInvalidTransition)
 			}
 			newVersion := current.Version + 1
-			if err := insertPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, "CHARGEBACK", request.Amount, journalReceipt.TransactionID, &reference); err != nil {
+			if err := recordPaymentEffect(ctx, tx, ids.EffectID, request.PaymentID, "CHARGEBACK",
+				request.Amount, journalReceipt.TransactionID, &reference, nil, hash); err != nil {
 				return Receipt{}, err
+			}
+			if current.AuthorityRegion != "" {
+				if _, err := escrow.PaymentReturnInTx(ctx, tx, escrow.EffectRequest{
+					EffectID: ids.EffectID, AccountID: current.AvailableAccountID,
+					AssetID: current.AssetID, Region: current.AuthorityRegion, Amount: request.Amount,
+				}); err != nil {
+					return Receipt{}, err
+				}
 			}
 			return Receipt{PaymentID: request.PaymentID, State: newState, Amount: request.Amount, Version: newVersion, Ledger: journalReceipt}, nil
 		})
@@ -829,21 +835,25 @@ FOR UPDATE`, paymentID, scope+"/hold").Scan(
 	return result, nil
 }
 
-func insertPaymentEffect(
+func recordPaymentEffect(
 	ctx context.Context, tx pgx.Tx, effectID, paymentID, kind string,
 	amount ledger.Amount, transactionID string, original *string,
+	expectedCashback *ledger.Amount, requestHash [32]byte,
 ) error {
 	var reference any
 	if original != nil {
 		reference = *original
 	}
-	_, err := tx.Exec(ctx, `
-INSERT INTO payment_effects (
-    payment_effect_id, payment_id, effect_kind, amount_atoms,
-    ledger_transaction_id, original_transaction_id
-) VALUES ($1, $2, $3, $4, $5, $6)`,
-		effectID, paymentID, kind, amount.String(), transactionID, reference)
-	return err
+	var expected any
+	if expectedCashback != nil {
+		expected = expectedCashback.String()
+	}
+	var inserted bool
+	err := tx.QueryRow(ctx, `
+SELECT public.record_payment_effect($1,$2,$3,$4,$5,$6,$7,$8)`,
+		effectID, paymentID, kind, amount.String(), transactionID, reference,
+		expected, requestHash[:]).Scan(&inserted)
+	return ledger.MapPostingError(err)
 }
 
 func validateCaptureReference(ctx context.Context, tx pgx.Tx, paymentID, transactionID string) error {

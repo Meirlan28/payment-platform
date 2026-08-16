@@ -1,0 +1,269 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-checkpointer-vault-agent
+  namespace: payments
+data:
+  agent.hcl: |
+    pid_file = "/var/run/vault-agent/pid"
+    exit_after_auth = false
+
+    vault {
+      address = "https://vault-active.vault.svc.cluster.local:8200"
+      ca_cert = "/var/run/vault/ca/ca.crt"
+      client_cert = "/var/run/vault/client/tls.crt"
+      client_key = "/var/run/vault/client/tls.key"
+      retry { num_retries = 12 }
+    }
+
+    auto_auth {
+      method "kubernetes" {
+        mount_path = "auth/kubernetes"
+        config = {
+          role = "audit-checkpointer"
+          token_path = "/var/run/workload-identity/vault-token"
+        }
+      }
+      sink "file" {
+        config = {
+          path = "/var/run/vault-agent/token"
+          mode = 0640
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-checkpointer
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: audit-checkpointer
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: audit-checkpointer
+  ports:
+    - {name: prom-export, port: 8889, targetPort: prom-export}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: audit-checkpointer
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: audit-checkpointer
+    app.kubernetes.io/component: immutable-audit
+spec:
+  serviceName: audit-checkpointer
+  replicas: 16
+  podManagementPolicy: Parallel
+  minReadySeconds: 10
+  updateStrategy: {type: RollingUpdate}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit-checkpointer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: audit-checkpointer
+        app.kubernetes.io/component: immutable-audit
+    spec:
+      serviceAccountName: audit-checkpointer
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: payment.example/dc
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: audit-checkpointer
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: audit-checkpointer
+      containers:
+        - name: audit-checkpointer
+          image: registry.invalid/payment-platform/audit-checkpointer:replace-with-signed-digest
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: ENVIRONMENT, value: production}
+            - {name: METRICS_ADDRESS, value: "127.0.0.1:9090"}
+            - {name: AUDIT_INTERVAL, value: "1s"}
+            - {name: AUDIT_CYCLE_TIMEOUT, value: "55s"}
+            - {name: AUDIT_MAX_RANGE_ENTRIES, value: "100000"}
+            - {name: AUDIT_READY_MAX_BACKLOG_ENTRIES, value: "100000"}
+            - {name: AUDIT_MAX_PENDING_PER_BOOK, value: "32"}
+            - {name: AUDIT_CONCURRENCY, value: "32"}
+            - {name: AUDIT_SHARD_COUNT, value: "16"}
+            - name: AUDIT_SHARD_INDEX
+              valueFrom:
+                fieldRef: {fieldPath: "metadata.labels['apps.kubernetes.io/pod-index']"}
+            - {name: DB_MAX_CONNECTIONS, value: "64"}
+            - name: DATABASE_URL
+              value: >-
+                postgresql://audit_checkpointer@cockroach-public.payments.svc.cluster.local:26257/payment_platform?sslmode=verify-full&sslrootcert=/var/run/cockroach/ca/ca.crt&sslcert=/var/run/cockroach/client/tls.crt&sslkey=/var/run/cockroach/client/tls.key
+            - {name: VAULT_ADDR, value: "https://vault-active.vault.svc.cluster.local:8200"}
+            - {name: VAULT_TOKEN_FILE, value: /var/run/vault-agent/token}
+            - {name: VAULT_CA_FILE, value: /var/run/vault/ca/ca.crt}
+            - {name: VAULT_CLIENT_CERT_FILE, value: /var/run/vault/client/tls.crt}
+            - {name: VAULT_CLIENT_KEY_FILE, value: /var/run/vault/client/tls.key}
+            - {name: VAULT_TRANSIT_MOUNT, value: transit}
+            - {name: VAULT_TRANSIT_KEY, value: audit-checkpoint}
+            - {name: VAULT_HSM_MANAGED_KEY, value: audit-checkpoint-hsm}
+            - {name: AUDIT_SINK_A_ID, value: worm-a}
+            - {name: AUDIT_SINK_A_ENDPOINT, value: "https://s3.audit-a.svc.cluster.local"}
+            - {name: AUDIT_SINK_A_STS_ENDPOINT, value: "https://sts.audit-a.svc.cluster.local"}
+            - {name: AUDIT_SINK_A_BUCKET, value: payment-audit-primary}
+            - {name: AUDIT_SINK_A_REGION, value: jurisdiction-a}
+            - {name: AUDIT_SINK_A_ROLE_ARN, value: "arn:aws:iam::111111111111:role/payment-audit-worm-a"}
+            - {name: AUDIT_SINK_A_EXPECTED_ACCOUNT_ID, value: "111111111111"}
+            - {name: AUDIT_SINK_A_WEB_IDENTITY_TOKEN_FILE, value: /var/run/workload-identity/worm-a-token}
+            - {name: AUDIT_SINK_A_CA_FILE, value: /var/run/worm-a/ca.crt}
+            - {name: AUDIT_SINK_B_ID, value: worm-b}
+            - {name: AUDIT_SINK_B_ENDPOINT, value: "https://s3.audit-b.svc.cluster.local"}
+            - {name: AUDIT_SINK_B_STS_ENDPOINT, value: "https://sts.audit-b.svc.cluster.local"}
+            - {name: AUDIT_SINK_B_BUCKET, value: payment-audit-secondary}
+            - {name: AUDIT_SINK_B_REGION, value: jurisdiction-b}
+            - {name: AUDIT_SINK_B_ROLE_ARN, value: "arn:aws:iam::222222222222:role/payment-audit-worm-b"}
+            - {name: AUDIT_SINK_B_EXPECTED_ACCOUNT_ID, value: "222222222222"}
+            - {name: AUDIT_SINK_B_WEB_IDENTITY_TOKEN_FILE, value: /var/run/workload-identity/worm-b-token}
+            - {name: AUDIT_SINK_B_CA_FILE, value: /var/run/worm-b/ca.crt}
+          resources:
+            requests: {cpu: "2", memory: 2Gi, ephemeral-storage: 256Mi}
+            limits: {cpu: "8", memory: 8Gi, ephemeral-storage: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: cockroach-client, mountPath: /var/run/cockroach/client, readOnly: true}
+            - {name: cockroach-ca, mountPath: /var/run/cockroach/ca, readOnly: true}
+            - {name: vault-client, mountPath: /var/run/vault/client, readOnly: true}
+            - {name: vault-ca, mountPath: /var/run/vault/ca, readOnly: true}
+            - {name: vault-agent-token, mountPath: /var/run/vault-agent, readOnly: true}
+            - {name: workload-identity, mountPath: /var/run/workload-identity, readOnly: true}
+            - {name: worm-a-ca, mountPath: /var/run/worm-a, readOnly: true}
+            - {name: worm-b-ca, mountPath: /var/run/worm-b, readOnly: true}
+        - name: vault-agent
+          image: registry.invalid/payment-platform/vault-agent:1.21.4-ent-replace-with-signed-digest
+          args: ["agent", "-config=/etc/vault-agent/agent.hcl"]
+          env:
+            - {name: HOME, value: /var/run/vault-agent}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: vault-agent-config, mountPath: /etc/vault-agent, readOnly: true}
+            - {name: vault-agent-token, mountPath: /var/run/vault-agent}
+            - {name: workload-identity, mountPath: /var/run/workload-identity, readOnly: true}
+            - {name: vault-client, mountPath: /var/run/vault/client, readOnly: true}
+            - {name: vault-ca, mountPath: /var/run/vault/ca, readOnly: true}
+        - name: otel-collector
+          image: registry.invalid/open-telemetry/opentelemetry-collector-contrib:0.135.0-replace-with-signed-digest
+          args: ["--config=/etc/otel/config.yaml"]
+          ports:
+            - {name: prom-export, containerPort: 8889}
+            - {name: otel-health, containerPort: 13133}
+          readinessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: otel-health}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: otel-config, mountPath: /etc/otel, readOnly: true}
+            - {name: otel-client, mountPath: /var/run/otel/client, readOnly: true}
+        - name: local-http-prober
+          image: registry.invalid/payment-platform/local-http-prober:replace-with-signed-digest
+          args: ["idle"]
+          startupProbe:
+            exec: {command: [/local-http-prober, check, --url=http://127.0.0.1:9090/ready, --timeout=250ms]}
+            periodSeconds: 5
+            failureThreshold: 240
+          readinessProbe:
+            exec: {command: [/local-http-prober, check, --url=http://127.0.0.1:9090/ready, --timeout=250ms]}
+            periodSeconds: 10
+            failureThreshold: 2
+          livenessProbe:
+            exec: {command: [/local-http-prober, check, --url=http://127.0.0.1:9090/live, --timeout=250ms]}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: cockroach-client
+          secret: {secretName: audit-checkpointer-cockroach-client-tls, defaultMode: 0400}
+        - name: cockroach-ca
+          configMap: {name: cockroach-public-ca}
+        - name: vault-client
+          secret: {secretName: audit-checkpointer-vault-client-tls, defaultMode: 0400}
+        - name: vault-ca
+          configMap: {name: vault-public-ca}
+        - name: vault-agent-config
+          configMap: {name: audit-checkpointer-vault-agent, defaultMode: 0440}
+        - name: vault-agent-token
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        - name: workload-identity
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  path: vault-token
+                  audience: vault.payments.example
+                  expirationSeconds: 600
+              - serviceAccountToken:
+                  path: worm-a-token
+                  audience: sts.worm-a.example
+                  expirationSeconds: 600
+              - serviceAccountToken:
+                  path: worm-b-token
+                  audience: sts.worm-b.example
+                  expirationSeconds: 600
+        - name: worm-a-ca
+          configMap: {name: audit-worm-a-ca}
+        - name: worm-b-ca
+          configMap: {name: audit-worm-b-ca}
+        - name: otel-config
+          configMap: {name: otel-payment-api-sidecar}
+        - name: otel-client
+          secret: {secretName: audit-checkpointer-otel-client-tls, defaultMode: 0400}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: audit-checkpointer
+  namespace: payments
+spec:
+  maxUnavailable: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: audit-checkpointer
