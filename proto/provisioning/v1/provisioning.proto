@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package provisioning.v1;
+
+option go_package = "github.com/example/payment-platform/gen/go/provisioning/v1;provisioningv1";
+
+// AccountProvisioningService opens ledger accounts. It is deliberately a
+// different service, credential class and database role from the payment API:
+// a compromised payment credential must not be able to open accounts, and a
+// compromised provisioning credential must not be able to move money.
+service AccountProvisioningService {
+  rpc ProvisionCustomerAccount(ProvisionCustomerAccountRequest) returns (ProvisionCustomerAccountResponse);
+  rpc ProvisionMerchantAccount(ProvisionMerchantAccountRequest) returns (ProvisionMerchantAccountResponse);
+}
+
+message ProvisionCustomerAccountRequest {
+  // Idempotency key owned by the caller, typically its user identifier. The
+  // same reference always resolves to the same wallet; the same reference with
+  // a different payload is rejected rather than silently deduplicated.
+  string external_reference = 1;
+  string asset_id = 2;
+  // Selector for the payment principal that will receive spending capability
+  // on the new accounts. This is NOT a principal string the caller invents:
+  // the server resolves it against an allowlist keyed by the authenticated
+  // caller's own identity, so a stolen provisioning credential cannot direct
+  // capability at an attacker-chosen principal. Empty selects the caller's
+  // configured default.
+  string payment_principal_selector = 3;
+  // Selector for the principal that will be allowed to move this customer's
+  // money to another person. Resolved against the same allowlist and by the
+  // same rules, but named separately because it is a different authority:
+  // authorizing a customer's payment to a merchant and sending their balance
+  // to a third party are not the same permission, and a deployment may well
+  // want them held by different workloads.
+  //
+  // Empty grants no transfer capability at all. That is deliberate — a wallet
+  // that cannot yet send money is a smaller problem than one whose payment
+  // principal silently gained the ability to.
+  string transfer_principal_selector = 4;
+}
+
+message ProvisionCustomerAccountResponse {
+  string region = 1;
+  string book_id = 2;
+  string available_account_id = 3;
+  string held_account_id = 4;
+  // True when this reference was already provisioned and the stored result was
+  // returned unchanged.
+  bool idempotent_replay = 5;
+}
+
+message ProvisionMerchantAccountRequest {
+  string account_id = 1;
+  string asset_id = 2;
+  string book_id = 3;
+  string payment_principal_selector = 4;
+}
+
+message ProvisionMerchantAccountResponse {
+  string account_id = 1;
+}

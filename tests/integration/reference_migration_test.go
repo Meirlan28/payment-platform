@@ -270,8 +270,22 @@ func applyAllMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, string(contents)); err != nil {
-			t.Fatalf("apply %s: %v", filepath.Base(path), err)
+		// Applied one statement at a time, through the same splitter the
+		// migrator uses. Sending a whole file as one batch is not how any
+		// deployment applies migrations, and CockroachDB does not make a
+		// column added earlier in a batch visible to a later statement in it —
+		// so a whole-file apply fails on migrations that are perfectly fine.
+		// A test that verified the migration set that way would be verifying
+		// something nothing does.
+		statements, err := schemamigration.Split(contents)
+		if err != nil {
+			t.Fatalf("split %s: %v", filepath.Base(path), err)
+		}
+		for _, statement := range statements {
+			if _, err := pool.Exec(ctx, statement.Contents); err != nil {
+				t.Fatalf("apply %s statement %d: %v",
+					filepath.Base(path), statement.Ordinal, err)
+			}
 		}
 	}
 }

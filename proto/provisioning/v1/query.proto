@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package provisioning.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/example/payment-platform/gen/go/provisioning/v1;provisioningv1";
+
+// LedgerQueryService exposes authoritative, read-only account state so that an
+// external read model can verify itself against the ledger. It holds no write
+// capability of any kind and runs under a role whose only privilege is SELECT.
+//
+// Reads are served at a caller-supplied past timestamp. Comparing a projection
+// against the ledger at a shared past watermark is what makes reconciliation
+// free of false positives: everything committed before the watermark has had
+// time to propagate, so a remaining difference is a real defect rather than
+// ordinary replication lag.
+service LedgerQueryService {
+  rpc GetAccountSnapshot(GetAccountSnapshotRequest) returns (GetAccountSnapshotResponse);
+}
+
+message GetAccountSnapshotRequest {
+  string account_id = 1;
+  string asset_id = 2;
+  string region = 3;
+  // Must be far enough in the past to be inside the cluster's retained history
+  // and outside the pipeline's propagation window.
+  google.protobuf.Timestamp as_of = 4;
+}
+
+message GetAccountSnapshotResponse {
+  string account_id = 1;
+  string asset_id = 2;
+  string region = 3;
+  // Canonical base-10 integer strings of atomic units.
+  string balance_atoms = 4;
+  string escrow_available_atoms = 5;
+  int64 last_sequence_no = 6;
+  google.protobuf.Timestamp as_of = 7;
+}

@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package transfer.v1;
+
+option go_package = "github.com/example/payment-platform/gen/go/transfer/v1;transferv1";
+
+// TransferService moves value directly between two customer accounts.
+//
+// It is a separate service from PaymentService, and its callers hold a
+// separate credential class, because the two operations are not the same
+// authority: a principal that may authorize a customer's payment to a merchant
+// has no business moving that customer's money to another person.
+//
+// A transfer is atomic and final when it returns. There is no authorize and
+// capture, because no merchant decides later whether to take the money — so
+// there is also no hold that could be stranded. A transfer is undone only by
+// another transfer in the opposite direction, never by editing this one.
+service TransferService {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // GetTransfer resolves an ambiguous outcome. A caller whose Execute timed
+  // out must never assume it failed; it asks here what actually happened.
+  rpc GetTransfer(GetTransferRequest) returns (GetTransferResponse);
+}
+
+message ExecuteRequest {
+  // The caller's own identifier for this transfer. Supplied rather than
+  // generated so a retry after a lost answer reproduces the identical request.
+  string transfer_id = 1;
+  // Idempotency identity. The same key from two different callers is two
+  // different transfers; the same key from one caller is always one.
+  string idempotency_scope = 2;
+  string idempotency_key = 3;
+  string asset_id = 4;
+  string payer_account_id = 5;
+  string payee_account_id = 6;
+  // Canonical base-10 integer string of atomic units, matching payment.v1.Money.
+  string amount_atoms = 7;
+  // Free text carried onto the journal entries and the settlement event. It is
+  // shown to both parties, so it is theirs, not the caller's.
+  string memo = 8;
+}
+
+message ExecuteResponse {
+  Transfer transfer = 1;
+  // True when this request had already been executed. The transfer described
+  // is the original one, and nothing moved a second time.
+  bool idempotent_replay = 2;
+}
+
+message GetTransferRequest {
+  // Either identifier resolves the transfer: the caller may know only the one
+  // it sent, and after a lost answer it may not be sure that one was accepted.
+  string transfer_id = 1;
+  string idempotency_scope = 2;
+  string idempotency_key = 3;
+}
+
+message GetTransferResponse {
+  Transfer transfer = 1;
+}
+
+message Transfer {
+  string transfer_id = 1;
+  string asset_id = 2;
+  string payer_account_id = 3;
+  string payee_account_id = 4;
+  string amount_atoms = 5;
+  // SETTLED or REVERSED. A transfer is never "pending": it either committed or
+  // it did not happen.
+  string state = 6;
+  // The ledger transactions written. For a transfer inside one book both name
+  // the same transaction, because one entry moved both sides.
+  string payer_transaction_id = 7;
+  string payee_transaction_id = 8;
+  string payer_book_id = 9;
+  string payee_book_id = 10;
+  bool cross_book = 11;
+}

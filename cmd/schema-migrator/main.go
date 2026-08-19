@@ -13,10 +13,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/example/payment-platform/internal/schemamigration"
 	"github.com/example/payment-platform/internal/store"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,10 +32,14 @@ type migration struct {
 	checksum [sha256.Size]byte
 }
 
-type migrationStatement struct {
-	ordinal  int64
-	contents string
-	checksum [sha256.Size]byte
+// migrationStatement is the shared splitter's statement, aliased so the rest
+// of this file reads unchanged.
+type migrationStatement = schemamigration.Statement
+
+// splitMigrationStatements delegates to the shared implementation, which the
+// migration tests exercise directly rather than reimplementing.
+func splitMigrationStatements(contents []byte) ([]migrationStatement, error) {
+	return schemamigration.Split(contents)
 }
 
 func main() {
@@ -333,16 +336,16 @@ func applyMigration(
 		// Exactly one SQL statement is executed as its own implicit transaction.
 		// CockroachDB explicitly does not promise atomic rollback for a batch of
 		// schema changes inside one explicit transaction.
-		if _, err := pool.Exec(ctx, statement.contents); err != nil {
-			wrapped := fmt.Errorf("execute %s statement %d: %w", next.version, statement.ordinal, err)
-			markMigrationFailed(ctx, runner, next.version, statement.ordinal, runID, wrapped)
+		if _, err := pool.Exec(ctx, statement.Contents); err != nil {
+			wrapped := fmt.Errorf("execute %s statement %d: %w", next.version, statement.Ordinal, err)
+			markMigrationFailed(ctx, runner, next.version, statement.Ordinal, runID, wrapped)
 			return wrapped
 		}
 		if err := completeMigrationStep(ctx, runner, next, statement, runID); err != nil {
 			// The statement may already be committed. Never replay it merely because
 			// recording its receipt was ambiguous or unavailable.
 			return fmt.Errorf("record %s statement %d (do not replay before inspection): %w",
-				next.version, statement.ordinal, err)
+				next.version, statement.Ordinal, err)
 		}
 	}
 	return finalizeMigration(ctx, runner, next, int64(len(statements)), runID)
@@ -364,13 +367,13 @@ func startMigrationStep(
 		err := tx.QueryRow(ctx, `
 SELECT statement_checksum, status
 FROM schema_migration_steps
-WHERE version=$1 AND ordinal=$2`, next.version, statement.ordinal).Scan(&stored, &status)
+WHERE version=$1 AND ordinal=$2`, next.version, statement.Ordinal).Scan(&stored, &status)
 		if err == nil {
-			if !bytes.Equal(stored, statement.checksum[:]) {
-				return fmt.Errorf("migration %s statement %d checksum changed", next.version, statement.ordinal)
+			if !bytes.Equal(stored, statement.Checksum[:]) {
+				return fmt.Errorf("migration %s statement %d checksum changed", next.version, statement.Ordinal)
 			}
 			return fmt.Errorf("migration %s statement %d has unresolved status %s; automatic replay is unsafe",
-				next.version, statement.ordinal, status)
+				next.version, statement.Ordinal, status)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -378,7 +381,7 @@ WHERE version=$1 AND ordinal=$2`, next.version, statement.ordinal).Scan(&stored,
 		_, err = tx.Exec(ctx, `
 INSERT INTO schema_migration_steps
     (version, ordinal, statement_checksum, status)
-VALUES ($1,$2,$3,'ACTIVE')`, next.version, statement.ordinal, statement.checksum[:])
+VALUES ($1,$2,$3,'ACTIVE')`, next.version, statement.Ordinal, statement.Checksum[:])
 		return err
 	})
 }
@@ -398,7 +401,7 @@ func completeMigrationStep(
 UPDATE schema_migration_steps
 SET status='APPLIED', completed_at=transaction_timestamp(), error=NULL
 WHERE version=$1 AND ordinal=$2 AND statement_checksum=$3 AND status='ACTIVE'`,
-			next.version, statement.ordinal, statement.checksum[:])
+			next.version, statement.Ordinal, statement.Checksum[:])
 		if err != nil {
 			return err
 		}
@@ -490,169 +493,6 @@ UPDATE schema_migration_attempts
 SET status='FAILED', error=$3, updated_at=transaction_timestamp()
 WHERE version=$1 AND owner_id=$2 AND status='ACTIVE'`, version, runID, message)
 		return err
-	})
-}
-
-// splitMigrationStatements is a conservative SQL lexical splitter. It honors
-// quoted identifiers, standard/E strings, nested block comments and tagged or
-// untagged dollar quotes used by PL/pgSQL bodies. It does not try to parse SQL;
-// it only recognizes semicolons that are outside those lexical constructs.
-func splitMigrationStatements(contents []byte) ([]migrationStatement, error) {
-	var result []migrationStatement
-	start := 0
-	inSingle := false
-	singleBackslashEscapes := false
-	inDouble := false
-	lineComment := false
-	blockDepth := 0
-	dollarTag := ""
-
-	for index := 0; index < len(contents); {
-		if lineComment {
-			if contents[index] == '\n' {
-				lineComment = false
-			}
-			index++
-			continue
-		}
-		if blockDepth > 0 {
-			if index+1 < len(contents) && contents[index] == '/' && contents[index+1] == '*' {
-				blockDepth++
-				index += 2
-				continue
-			}
-			if index+1 < len(contents) && contents[index] == '*' && contents[index+1] == '/' {
-				blockDepth--
-				index += 2
-				continue
-			}
-			index++
-			continue
-		}
-		if dollarTag != "" {
-			if bytes.HasPrefix(contents[index:], []byte(dollarTag)) {
-				index += len(dollarTag)
-				dollarTag = ""
-				continue
-			}
-			index++
-			continue
-		}
-		if inSingle {
-			if singleBackslashEscapes && contents[index] == '\\' && index+1 < len(contents) {
-				index += 2
-				continue
-			}
-			if contents[index] == '\'' {
-				if index+1 < len(contents) && contents[index+1] == '\'' {
-					index += 2
-					continue
-				}
-				inSingle = false
-				singleBackslashEscapes = false
-			}
-			index++
-			continue
-		}
-		if inDouble {
-			if contents[index] == '"' {
-				if index+1 < len(contents) && contents[index+1] == '"' {
-					index += 2
-					continue
-				}
-				inDouble = false
-			}
-			index++
-			continue
-		}
-
-		if index+1 < len(contents) && contents[index] == '-' && contents[index+1] == '-' {
-			lineComment = true
-			index += 2
-			continue
-		}
-		if index+1 < len(contents) && contents[index] == '/' && contents[index+1] == '*' {
-			blockDepth = 1
-			index += 2
-			continue
-		}
-		switch contents[index] {
-		case '\'':
-			inSingle = true
-			singleBackslashEscapes = escapeStringPrefix(contents, index)
-			index++
-			continue
-		case '"':
-			inDouble = true
-			index++
-			continue
-		case '$':
-			if index == 0 || !identifierByte(contents[index-1]) {
-				if tag, ok := readDollarTag(contents[index:]); ok {
-					dollarTag = tag
-					index += len(tag)
-					continue
-				}
-			}
-		case ';':
-			appendMigrationStatement(&result, contents[start:index+1])
-			start = index + 1
-		}
-		index++
-	}
-	if inSingle || inDouble || blockDepth != 0 || dollarTag != "" {
-		return nil, errors.New("migration contains an unterminated SQL lexical construct")
-	}
-	appendMigrationStatement(&result, contents[start:])
-	if len(result) == 0 {
-		return nil, errors.New("migration contains no SQL statements")
-	}
-	return result, nil
-}
-
-func escapeStringPrefix(contents []byte, quote int) bool {
-	if quote >= 1 && (contents[quote-1] == 'e' || contents[quote-1] == 'E') &&
-		(quote == 1 || !identifierByte(contents[quote-2])) {
-		return true
-	}
-	return quote >= 2 && contents[quote-1] == '&' &&
-		(contents[quote-2] == 'u' || contents[quote-2] == 'U') &&
-		(quote == 2 || !identifierByte(contents[quote-3]))
-}
-
-func identifierByte(character byte) bool {
-	return (character >= 'a' && character <= 'z') ||
-		(character >= 'A' && character <= 'Z') ||
-		(character >= '0' && character <= '9') || character == '_' ||
-		character == '$' || character >= utf8.RuneSelf
-}
-
-func readDollarTag(contents []byte) (string, bool) {
-	if len(contents) == 0 || contents[0] != '$' {
-		return "", false
-	}
-	for index := 1; index < len(contents); index++ {
-		if contents[index] == '$' {
-			return string(contents[:index+1]), true
-		}
-		character := contents[index]
-		if !((character >= 'a' && character <= 'z') ||
-			(character >= 'A' && character <= 'Z') ||
-			(character >= '0' && character <= '9' && index > 1) || character == '_') {
-			return "", false
-		}
-	}
-	return "", false
-}
-
-func appendMigrationStatement(result *[]migrationStatement, raw []byte) {
-	statement := strings.TrimSpace(string(raw))
-	if statement == "" {
-		return
-	}
-	checksum := sha256.Sum256([]byte(statement))
-	*result = append(*result, migrationStatement{
-		ordinal: int64(len(*result) + 1), contents: statement, checksum: checksum,
 	})
 }
 

@@ -59,7 +59,7 @@ type S3Sink struct {
 
 	mu               sync.RWMutex
 	providerIdentity string
-	lastProbe         time.Time
+	lastProbe        time.Time
 }
 
 func NewS3Sink(ctx context.Context, config S3Config) (*S3Sink, error) {

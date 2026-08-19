@@ -63,10 +63,10 @@ INSERT INTO "quoted;name" VALUES (E'backslash\\\';still-string');
 		t.Fatalf("got %d statements, want 3", len(statements))
 	}
 	for index, statement := range statements {
-		if statement.ordinal != int64(index+1) {
-			t.Fatalf("statement %d has ordinal %d", index, statement.ordinal)
+		if statement.Ordinal != int64(index+1) {
+			t.Fatalf("statement %d has ordinal %d", index, statement.Ordinal)
 		}
-		if statement.checksum != sha256.Sum256([]byte(statement.contents)) {
+		if statement.Checksum != sha256.Sum256([]byte(statement.Contents)) {
 			t.Fatalf("statement %d checksum is not over exact executable text", index)
 		}
 	}

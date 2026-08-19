@@ -58,84 +58,137 @@ ON CONFLICT (asset_id) DO NOTHING`, asset.AssetID, asset.DisplayCode, asset.Atom
 }
 
 func (s *Service) CreateBook(ctx context.Context, book Book) error {
+	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		return s.CreateBookInTx(ctx, tx, book)
+	})
+}
+
+// EnsureBook is the idempotent form of CreateBook: it accepts a book that
+// already exists and has posted, provided its identity matches. Tools that may
+// legitimately run twice against a live ledger use this instead of CreateBook,
+// whose stricter check exists to catch an accidental re-creation.
+func (s *Service) EnsureBook(ctx context.Context, book Book) error {
+	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		return s.EnsureBookInTx(ctx, tx, book)
+	})
+}
+
+// CreateBookInTx lets a caller open a book in the same serializable
+// transaction as the rest of its operation. Like CreateBook it requires a book
+// that has never posted, so an accidental re-creation of an active book is an
+// error rather than a silent no-op.
+func (s *Service) CreateBookInTx(ctx context.Context, tx pgx.Tx, book Book) error {
+	return s.upsertBookInTx(ctx, tx, book, true)
+}
+
+// EnsureBookInTx opens the book if it does not exist and otherwise verifies
+// that the existing one has the same identity. Unlike CreateBookInTx it
+// tolerates a book that has already posted, because account provisioning
+// re-enters this path for every customer opened into an existing regional
+// book. It still refuses a book whose legal entity, jurisdiction or genesis
+// differs from the caller's expectation.
+func (s *Service) EnsureBookInTx(ctx context.Context, tx pgx.Tx, book Book) error {
+	return s.upsertBookInTx(ctx, tx, book, false)
+}
+
+func (s *Service) upsertBookInTx(ctx context.Context, tx pgx.Tx, book Book, requireUnposted bool) error {
+	if tx == nil {
+		return fmt.Errorf("%w: nil database transaction", ErrInvalidPosting)
+	}
 	if err := book.Validate(); err != nil {
 		return err
 	}
 	if book.GenesisHash == ([32]byte{}) {
 		book.GenesisHash = GenesisHash(book.BookID)
 	}
-	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 INSERT INTO books (book_id, legal_entity_id, jurisdiction, last_entry_hash)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (book_id) DO NOTHING`, book.BookID, book.LegalEntityID, book.Jurisdiction, book.GenesisHash[:])
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			return nil
-		}
-		var legalEntity, jurisdiction string
-		var genesis []byte
-		var next int64
-		if err := tx.QueryRow(ctx, `
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var legalEntity, jurisdiction string
+	var genesis []byte
+	var next int64
+	if err := tx.QueryRow(ctx, `
 SELECT legal_entity_id, jurisdiction, next_sequence_no, last_entry_hash
 FROM books WHERE book_id=$1`, book.BookID).Scan(&legalEntity, &jurisdiction, &next, &genesis); err != nil {
-			return err
-		}
-		if legalEntity != book.LegalEntityID || jurisdiction != book.Jurisdiction || next != 1 || !bytes.Equal(genesis, book.GenesisHash[:]) {
-			return fmt.Errorf("%w: book id exists with a different definition or has already posted", ErrInvalidPosting)
-		}
-		return nil
-	})
+		return err
+	}
+	if legalEntity != book.LegalEntityID || jurisdiction != book.Jurisdiction {
+		return fmt.Errorf("%w: book id exists with a different definition", ErrInvalidPosting)
+	}
+	if requireUnposted && next != 1 {
+		return fmt.Errorf("%w: book id exists and has already posted", ErrInvalidPosting)
+	}
+	// last_entry_hash is the head of the book's hash chain, so it equals the
+	// genesis hash only while the book has posted nothing. Comparing it on an
+	// active book would reject every legitimate re-entry.
+	if next == 1 && !bytes.Equal(genesis, book.GenesisHash[:]) {
+		return fmt.Errorf("%w: book id exists with a different genesis", ErrInvalidPosting)
+	}
+	return nil
 }
 
 func (s *Service) CreateAccount(ctx context.Context, account Account) error {
+	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		return s.CreateAccountInTx(ctx, tx, account)
+	})
+}
+
+// CreateAccountInTx is the in-transaction form of CreateAccount. See
+// CreateBookInTx for why provisioning needs one commit outcome.
+func (s *Service) CreateAccountInTx(ctx context.Context, tx pgx.Tx, account Account) error {
+	if tx == nil {
+		return fmt.Errorf("%w: nil database transaction", ErrInvalidPosting)
+	}
 	if err := account.Validate(); err != nil {
 		return err
 	}
-	return s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 INSERT INTO accounts (
     account_id, book_id, asset_id, account_type, normal_side,
     enforce_spend_limit, credit_limit_atoms
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (account_id) DO NOTHING`,
-			account.AccountID, account.BookID, account.AssetID, account.AccountType,
-			string(account.NormalSide), account.EnforceSpendLimit, account.CreditLimitAtoms.String())
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			var stored Account
-			var normal, creditLimit string
-			err := tx.QueryRow(ctx, `
+		account.AccountID, account.BookID, account.AssetID, account.AccountType,
+		string(account.NormalSide), account.EnforceSpendLimit, account.CreditLimitAtoms.String())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var stored Account
+		var normal, creditLimit string
+		err := tx.QueryRow(ctx, `
 SELECT account_id, book_id, asset_id, account_type, normal_side,
        enforce_spend_limit, credit_limit_atoms
 FROM accounts WHERE account_id=$1`, account.AccountID).Scan(
-				&stored.AccountID, &stored.BookID, &stored.AssetID, &stored.AccountType,
-				&normal, &stored.EnforceSpendLimit, &creditLimit)
-			stored.NormalSide = Side(normal)
-			if err != nil {
-				return err
-			}
-			stored.CreditLimitAtoms, err = ParseAmount(creditLimit)
-			if err != nil {
-				return err
-			}
-			if stored.AccountID != account.AccountID || stored.BookID != account.BookID ||
-				stored.AssetID != account.AssetID || stored.AccountType != account.AccountType ||
-				stored.NormalSide != account.NormalSide ||
-				stored.EnforceSpendLimit != account.EnforceSpendLimit ||
-				stored.CreditLimitAtoms.Cmp(account.CreditLimitAtoms) != 0 {
-				return fmt.Errorf("%w: account id exists with different definition", ErrInvalidPosting)
-			}
+			&stored.AccountID, &stored.BookID, &stored.AssetID, &stored.AccountType,
+			&normal, &stored.EnforceSpendLimit, &creditLimit)
+		stored.NormalSide = Side(normal)
+		if err != nil {
+			return err
 		}
-		_, err = tx.Exec(ctx, `
+		stored.CreditLimitAtoms, err = ParseAmount(creditLimit)
+		if err != nil {
+			return err
+		}
+		if stored.AccountID != account.AccountID || stored.BookID != account.BookID ||
+			stored.AssetID != account.AssetID || stored.AccountType != account.AccountType ||
+			stored.NormalSide != account.NormalSide ||
+			stored.EnforceSpendLimit != account.EnforceSpendLimit ||
+			stored.CreditLimitAtoms.Cmp(account.CreditLimitAtoms) != 0 {
+			return fmt.Errorf("%w: account id exists with different definition", ErrInvalidPosting)
+		}
+	}
+	_, err = tx.Exec(ctx, `
 INSERT INTO account_balances (account_id) VALUES ($1)
 ON CONFLICT (account_id) DO NOTHING`, account.AccountID)
-		return err
-	})
+	return err
 }
 
 func (s *Service) Post(ctx context.Context, request PostRequest) (Receipt, error) {

@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package provisioning.v1;
+
+option go_package = "github.com/example/payment-platform/gen/go/provisioning/v1;provisioningv1";
+
+// FundingService credits a provisioned customer account. Its caller is a rail
+// or settlement adapter that already holds evidence that value arrived; this
+// service records value, it does not decide that value exists.
+//
+// A deposit raises the ledger balance and the regional escrow spending right
+// in one transaction, because payment authorization spends escrow rights. A
+// balance without rights would be unspendable and rights without a balance
+// would permit an overdraft, so neither is ever written alone.
+service FundingService {
+  rpc Deposit(DepositRequest) returns (DepositResponse);
+}
+
+message DepositRequest {
+  // Idempotency key owned by the caller. Retrying a timed-out deposit with the
+  // same reference is always safe; reusing it with a different payload is an
+  // error.
+  string external_reference = 1;
+  string account_id = 2;
+  // Canonical base-10 integer string of atomic units, matching payment.v1.Money.
+  // A decimal string keeps DECIMAL(38,0) exact in every language.
+  string asset_id = 3;
+  string amount_atoms = 4;
+  // The rail, settlement or statement reference proving the funds arrived.
+  string funding_source_reference = 5;
+}
+
+message DepositResponse {
+  string ledger_transaction_id = 1;
+  bool idempotent_replay = 2;
+}

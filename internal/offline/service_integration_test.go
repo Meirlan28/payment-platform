@@ -1132,10 +1132,10 @@ func TestOfflineRuntimeCannotRawMintOrBypassCoherentProcedures(t *testing.T) {
 	}
 	for name, statement := range map[string]string{
 		"coherent authority mint": `UPDATE escrow_authorities SET total_authority=total_authority+100, unallocated=unallocated+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
-		"raw total authority":    `UPDATE escrow_authorities SET total_authority=total_authority+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
-		"raw regional authority": `UPDATE escrow_regional_rights SET available=available+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
-		"raw allowance":          `UPDATE offline_allowances SET state='REDEEMED', redeemed_at=transaction_timestamp() WHERE allowance_id='` + allowance.AllowanceID + `'`,
-		"raw proof":              `INSERT INTO offline_non_redemption_proofs (allowance_id,terminal_kind,payload_hash,issuer_epoch,device_counter,fence_version,policy_evidence_hash,closure_set_hash,proof_hash) SELECT allowance_id,'REVOKED',payload_hash,issuer_epoch,device_counter,1,payload_hash,payload_hash,payload_hash FROM offline_allowances WHERE allowance_id='` + allowance.AllowanceID + `'`,
+		"raw total authority":     `UPDATE escrow_authorities SET total_authority=total_authority+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
+		"raw regional authority":  `UPDATE escrow_regional_rights SET available=available+100 WHERE account_id='` + fixture.accountID + `' AND asset_id='` + fixture.assetID + `'`,
+		"raw allowance":           `UPDATE offline_allowances SET state='REDEEMED', redeemed_at=transaction_timestamp() WHERE allowance_id='` + allowance.AllowanceID + `'`,
+		"raw proof":               `INSERT INTO offline_non_redemption_proofs (allowance_id,terminal_kind,payload_hash,issuer_epoch,device_counter,fence_version,policy_evidence_hash,closure_set_hash,proof_hash) SELECT allowance_id,'REVOKED',payload_hash,issuer_epoch,device_counter,1,payload_hash,payload_hash,payload_hash FROM offline_allowances WHERE allowance_id='` + allowance.AllowanceID + `'`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			tx, err := fixture.pool.BeginTx(fixture.ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})

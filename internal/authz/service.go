@@ -21,6 +21,12 @@ const (
 	CaptureCashbackExpense    = "CAPTURE_CASHBACK_EXPENSE"
 	RefundMerchantDebit       = "REFUND_MERCHANT_DEBIT"
 	ChargebackMerchantReserve = "CHARGEBACK_MERCHANT_RESERVE"
+	// Transfers between customers. Held separately from the payment
+	// permissions, and separately from each other, so that no single
+	// credential can both take money from one account and put it into
+	// another of its choosing.
+	TransferDebitAvailable  = "TRANSFER_DEBIT_AVAILABLE"
+	TransferCreditAvailable = "TRANSFER_CREDIT_AVAILABLE"
 )
 
 var ErrDenied = errors.New("authz: payment account capability denied")
