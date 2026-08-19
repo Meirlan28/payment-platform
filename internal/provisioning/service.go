@@ -307,6 +307,12 @@ type MerchantAccountRequest struct {
 	AssetID            string
 	BookID             string
 	PaymentPrincipalID string
+	// RefundPrincipalID may debit this merchant account to refund a customer.
+	// Empty grants no refund capability, which is the safe default for the
+	// same reason the transfer principal has one: a payment credential that
+	// silently gained the ability to move money out of merchants and into
+	// wallets is a much larger problem than a merchant that cannot yet refund.
+	RefundPrincipalID string
 }
 
 // ProvisionMerchantAccount is idempotent on AccountID. Without it a wallet has
@@ -337,8 +343,15 @@ func (s *Service) ProvisionMerchantAccount(ctx context.Context, request Merchant
 		}); err != nil {
 			return err
 		}
-		return s.grantCapability(ctx, tx, request.PaymentPrincipalID, request.BookID,
-			request.AccountID, authz.AuthorizeMerchant, hash)
+		if err := s.grantCapability(ctx, tx, request.PaymentPrincipalID, request.BookID,
+			request.AccountID, authz.AuthorizeMerchant, hash); err != nil {
+			return err
+		}
+		if request.RefundPrincipalID == "" {
+			return nil
+		}
+		return s.grantCapability(ctx, tx, request.RefundPrincipalID, request.BookID,
+			request.AccountID, authz.RefundMerchantDebit, hash)
 	})
 }
 

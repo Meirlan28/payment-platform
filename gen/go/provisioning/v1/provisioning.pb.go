@@ -192,8 +192,15 @@ type ProvisionMerchantAccountRequest struct {
 	AssetId                  string                 `protobuf:"bytes,2,opt,name=asset_id,json=assetId,proto3" json:"asset_id,omitempty"`
 	BookId                   string                 `protobuf:"bytes,3,opt,name=book_id,json=bookId,proto3" json:"book_id,omitempty"`
 	PaymentPrincipalSelector string                 `protobuf:"bytes,4,opt,name=payment_principal_selector,json=paymentPrincipalSelector,proto3" json:"payment_principal_selector,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// The identity permitted to debit this merchant account when refunding a
+	// customer. Resolved against the same allowlist and by the same rules as the
+	// payment principal, and deliberately a different identity: a refund moves
+	// money out of the merchant and into a customer wallet, which is the
+	// opposite direction from a payment and a materially worse thing for a
+	// stolen payment credential to be able to do.
+	RefundPrincipalSelector string `protobuf:"bytes,5,opt,name=refund_principal_selector,json=refundPrincipalSelector,proto3" json:"refund_principal_selector,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ProvisionMerchantAccountRequest) Reset() {
@@ -250,6 +257,13 @@ func (x *ProvisionMerchantAccountRequest) GetBookId() string {
 func (x *ProvisionMerchantAccountRequest) GetPaymentPrincipalSelector() string {
 	if x != nil {
 		return x.PaymentPrincipalSelector
+	}
+	return ""
+}
+
+func (x *ProvisionMerchantAccountRequest) GetRefundPrincipalSelector() string {
+	if x != nil {
+		return x.RefundPrincipalSelector
 	}
 	return ""
 }
@@ -313,13 +327,14 @@ const file_provisioning_v1_provisioning_proto_rawDesc = "" +
 	"\abook_id\x18\x02 \x01(\tR\x06bookId\x120\n" +
 	"\x14available_account_id\x18\x03 \x01(\tR\x12availableAccountId\x12&\n" +
 	"\x0fheld_account_id\x18\x04 \x01(\tR\rheldAccountId\x12+\n" +
-	"\x11idempotent_replay\x18\x05 \x01(\bR\x10idempotentReplay\"\xb2\x01\n" +
+	"\x11idempotent_replay\x18\x05 \x01(\bR\x10idempotentReplay\"\xee\x01\n" +
 	"\x1fProvisionMerchantAccountRequest\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x19\n" +
 	"\basset_id\x18\x02 \x01(\tR\aassetId\x12\x17\n" +
 	"\abook_id\x18\x03 \x01(\tR\x06bookId\x12<\n" +
-	"\x1apayment_principal_selector\x18\x04 \x01(\tR\x18paymentPrincipalSelector\"A\n" +
+	"\x1apayment_principal_selector\x18\x04 \x01(\tR\x18paymentPrincipalSelector\x12:\n" +
+	"\x19refund_principal_selector\x18\x05 \x01(\tR\x17refundPrincipalSelector\"A\n" +
 	" ProvisionMerchantAccountResponse\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId2\x9e\x02\n" +

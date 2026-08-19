@@ -54,6 +54,13 @@ message ProvisionMerchantAccountRequest {
   string asset_id = 2;
   string book_id = 3;
   string payment_principal_selector = 4;
+  // The identity permitted to debit this merchant account when refunding a
+  // customer. Resolved against the same allowlist and by the same rules as the
+  // payment principal, and deliberately a different identity: a refund moves
+  // money out of the merchant and into a customer wallet, which is the
+  // opposite direction from a payment and a materially worse thing for a
+  // stolen payment credential to be able to do.
+  string refund_principal_selector = 5;
 }
 
 message ProvisionMerchantAccountResponse {

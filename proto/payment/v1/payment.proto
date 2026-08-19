@@ -123,4 +123,18 @@ message ChargebackResponse {
 
 message GetPaymentResponse {
   Payment payment = 1;
+  // The ledger transactions a refund must reverse against, newest last.
+  //
+  // A refund folds against a specific capture, so its transaction identifier
+  // has to come from somewhere. Returning it here means a caller does not have
+  // to have recorded it at the moment of capture — a payment whose capture
+  // receipt was lost to a crash, or that predates the caller keeping one, is
+  // still refundable.
+  repeated string capture_transaction_ids = 2;
+  // How much of this payment has already been returned, so a caller can size a
+  // partial refund without keeping its own running total and risking a
+  // disagreement with the ledger about the remainder.
+  string captured_atoms = 3;
+  string refunded_atoms = 4;
+  string charged_back_atoms = 5;
 }

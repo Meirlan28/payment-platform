@@ -50,6 +50,9 @@ func (f *fakePayments) Chargeback(context.Context, payment.ChargebackRequest) (p
 func (f *fakePayments) GetForScope(context.Context, string, string) (payment.Receipt, error) {
 	return f.receipt, f.err
 }
+func (f *fakePayments) GetDetailsForScope(context.Context, string, string) (payment.Details, error) {
+	return payment.Details{Receipt: f.receipt}, f.err
+}
 
 type fakeErrorObserver struct {
 	operation string

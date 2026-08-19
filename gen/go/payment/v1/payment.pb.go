@@ -1044,10 +1044,24 @@ func (x *ChargebackResponse) GetPayment() *Payment {
 }
 
 type GetPaymentResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Payment       *Payment               `protobuf:"bytes,1,opt,name=payment,proto3" json:"payment,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Payment *Payment               `protobuf:"bytes,1,opt,name=payment,proto3" json:"payment,omitempty"`
+	// The ledger transactions a refund must reverse against, newest last.
+	//
+	// A refund folds against a specific capture, so its transaction identifier
+	// has to come from somewhere. Returning it here means a caller does not have
+	// to have recorded it at the moment of capture — a payment whose capture
+	// receipt was lost to a crash, or that predates the caller keeping one, is
+	// still refundable.
+	CaptureTransactionIds []string `protobuf:"bytes,2,rep,name=capture_transaction_ids,json=captureTransactionIds,proto3" json:"capture_transaction_ids,omitempty"`
+	// How much of this payment has already been returned, so a caller can size a
+	// partial refund without keeping its own running total and risking a
+	// disagreement with the ledger about the remainder.
+	CapturedAtoms    string `protobuf:"bytes,3,opt,name=captured_atoms,json=capturedAtoms,proto3" json:"captured_atoms,omitempty"`
+	RefundedAtoms    string `protobuf:"bytes,4,opt,name=refunded_atoms,json=refundedAtoms,proto3" json:"refunded_atoms,omitempty"`
+	ChargedBackAtoms string `protobuf:"bytes,5,opt,name=charged_back_atoms,json=chargedBackAtoms,proto3" json:"charged_back_atoms,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *GetPaymentResponse) Reset() {
@@ -1085,6 +1099,34 @@ func (x *GetPaymentResponse) GetPayment() *Payment {
 		return x.Payment
 	}
 	return nil
+}
+
+func (x *GetPaymentResponse) GetCaptureTransactionIds() []string {
+	if x != nil {
+		return x.CaptureTransactionIds
+	}
+	return nil
+}
+
+func (x *GetPaymentResponse) GetCapturedAtoms() string {
+	if x != nil {
+		return x.CapturedAtoms
+	}
+	return ""
+}
+
+func (x *GetPaymentResponse) GetRefundedAtoms() string {
+	if x != nil {
+		return x.RefundedAtoms
+	}
+	return ""
+}
+
+func (x *GetPaymentResponse) GetChargedBackAtoms() string {
+	if x != nil {
+		return x.ChargedBackAtoms
+	}
+	return ""
 }
 
 var File_payment_v1_payment_proto protoreflect.FileDescriptor
@@ -1175,9 +1217,13 @@ const file_payment_v1_payment_proto_rawDesc = "" +
 	"\x0eRefundResponse\x12-\n" +
 	"\apayment\x18\x01 \x01(\v2\x13.payment.v1.PaymentR\apayment\"C\n" +
 	"\x12ChargebackResponse\x12-\n" +
-	"\apayment\x18\x01 \x01(\v2\x13.payment.v1.PaymentR\apayment\"C\n" +
+	"\apayment\x18\x01 \x01(\v2\x13.payment.v1.PaymentR\apayment\"\xf7\x01\n" +
 	"\x12GetPaymentResponse\x12-\n" +
-	"\apayment\x18\x01 \x01(\v2\x13.payment.v1.PaymentR\apayment2\x84\x04\n" +
+	"\apayment\x18\x01 \x01(\v2\x13.payment.v1.PaymentR\apayment\x126\n" +
+	"\x17capture_transaction_ids\x18\x02 \x03(\tR\x15captureTransactionIds\x12%\n" +
+	"\x0ecaptured_atoms\x18\x03 \x01(\tR\rcapturedAtoms\x12%\n" +
+	"\x0erefunded_atoms\x18\x04 \x01(\tR\rrefundedAtoms\x12,\n" +
+	"\x12charged_back_atoms\x18\x05 \x01(\tR\x10chargedBackAtoms2\x84\x04\n" +
 	"\x0ePaymentService\x12H\n" +
 	"\tAuthorize\x12\x1c.payment.v1.AuthorizeRequest\x1a\x1d.payment.v1.AuthorizeResponse\x12B\n" +
 	"\aCapture\x12\x1a.payment.v1.CaptureRequest\x1a\x1b.payment.v1.CaptureResponse\x12B\n" +

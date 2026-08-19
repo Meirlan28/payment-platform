@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/example/payment-platform/internal/escrow"
@@ -506,7 +507,7 @@ func (s *Service) Refund(ctx context.Context, request RefundRequest) (Receipt, e
 	}
 	return s.execute(ctx, request.Scope+"/refund", request.IdempotencyKey, hash, "payment.refunded",
 		func(ctx context.Context, tx pgx.Tx, ids executionIDs) (Receipt, error) {
-			current, err := loadSnapshot(ctx, tx, request.Scope, request.PaymentID)
+			current, err := loadReturnable(ctx, tx, request.PaymentID)
 			if err != nil {
 				return Receipt{}, err
 			}
@@ -588,7 +589,7 @@ func (s *Service) Chargeback(ctx context.Context, request ChargebackRequest) (Re
 	}
 	return s.execute(ctx, request.Scope+"/chargeback", request.IdempotencyKey, hash, "payment.charged_back",
 		func(ctx context.Context, tx pgx.Tx, ids executionIDs) (Receipt, error) {
-			current, err := loadSnapshot(ctx, tx, request.Scope, request.PaymentID)
+			current, err := loadReturnable(ctx, tx, request.PaymentID)
 			if err != nil {
 				return Receipt{}, err
 			}
@@ -656,6 +657,78 @@ WHERE payment_id=$1 AND version=$5
 			}
 			return Receipt{PaymentID: request.PaymentID, State: newState, Amount: request.Amount, Version: newVersion, Ledger: journalReceipt}, nil
 		})
+}
+
+// Details is everything a caller needs to decide on and size a return.
+//
+// It is a separate type from Receipt on purpose: Receipt is serialized into
+// the idempotency record and replayed verbatim, so widening it would change
+// payloads that were already written.
+type Details struct {
+	Receipt
+	// CaptureTransactionIDs are the transactions a refund may fold against,
+	// oldest first. Returning them means a caller that never recorded the
+	// capture receipt — or lost it to a crash — can still refund.
+	CaptureTransactionIDs []string
+	Captured              ledger.Amount
+	Refunded              ledger.Amount
+	ChargedBack           ledger.Amount
+}
+
+// GetDetailsForScope returns the payment together with the return-relevant
+// facts, under the same scope rule as GetForScope: only the principal that
+// created the payment may read it.
+func (s *Service) GetDetailsForScope(ctx context.Context, scope, paymentID string) (Details, error) {
+	if scope == "" || paymentID == "" {
+		return Details{}, ErrInvalidRequest
+	}
+	var result Details
+	err := s.transactions.RunSerializable(ctx, func(tx pgx.Tx) error {
+		var state, authorized, captured, refunded, chargedBack string
+		err := tx.QueryRow(ctx, `
+SELECT payment_id, state, authorized_atoms::STRING, captured_atoms::STRING,
+       refunded_atoms::STRING, charged_back_atoms::STRING, version
+FROM payment_operations
+WHERE payment_id=$1 AND idempotency_scope=$2`, paymentID, scope+"/hold").Scan(
+			&result.PaymentID, &state, &authorized, &captured, &refunded,
+			&chargedBack, &result.Version)
+		if err != nil {
+			return err
+		}
+		result.State = State(state)
+		if result.Amount, err = ledger.ParseAmount(authorized); err != nil {
+			return err
+		}
+		if result.Captured, err = ledger.ParseAmount(captured); err != nil {
+			return err
+		}
+		if result.Refunded, err = ledger.ParseAmount(refunded); err != nil {
+			return err
+		}
+		if result.ChargedBack, err = ledger.ParseAmount(chargedBack); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+SELECT ledger_transaction_id FROM payment_effects
+ WHERE payment_id=$1 AND effect_kind='CAPTURE'
+ ORDER BY created_at, payment_effect_id`, paymentID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var transactionID string
+			if err := rows.Scan(&transactionID); err != nil {
+				return err
+			}
+			result.CaptureTransactionIDs = append(result.CaptureTransactionIDs, transactionID)
+		}
+		return rows.Err()
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Details{}, ErrPaymentNotFound
+	}
+	return result, err
 }
 
 // GetForScope returns a payment only to the principal scope that created the
@@ -786,6 +859,47 @@ func (s *Service) nextID(ctx context.Context, prefix string) (string, error) {
 		return "", errors.New("payment: ID generator returned an empty id")
 	}
 	return prefix + id, nil
+}
+
+// loadReturnable locates a payment for a return — a refund or a chargeback —
+// by its identifier alone.
+//
+// Every other operation on a payment goes through loadSnapshot, which also
+// requires the caller's idempotency scope to match the one recorded when the
+// payment was authorized. That is the right rule for a hold's own lifecycle:
+// capturing or releasing somebody else's hold is never legitimate, and the
+// scope makes it impossible.
+//
+// A return is different in kind. It takes money back out of the merchant and
+// gives it to the customer, and the party entitled to do that is not the party
+// that authorized the payment — it is whoever holds the merchant side of it.
+// The ledger already expresses that precisely: Refund is gated on
+// REFUND_MERCHANT_DEBIT and Chargeback on CHARGEBACK_MERCHANT_RESERVE, both
+// checked against the merchant account named in the request before this
+// function is reached. Requiring the authorizing principal's scope on top of
+// that is a second, implicit rule that contradicts the explicit one — it
+// forces refunds to be issued by the same credential that issues payments,
+// which is exactly the credential separation the capability model exists to
+// allow.
+//
+// So the capability is the control, and the identifier is the lookup. Nothing
+// is loosened by this: without a capability grant on that specific merchant
+// account, in that specific book, a caller holding a payment identifier can
+// still do nothing at all with it.
+func loadReturnable(ctx context.Context, tx pgx.Tx, paymentID string) (snapshot, error) {
+	var scope string
+	err := tx.QueryRow(ctx,
+		`SELECT idempotency_scope FROM payment_operations WHERE payment_id=$1`,
+		paymentID).Scan(&scope)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return snapshot{}, ErrPaymentNotFound
+	}
+	if err != nil {
+		return snapshot{}, err
+	}
+	// The stored scope always ends in the "/hold" suffix loadSnapshot appends,
+	// so it is trimmed back to the scope loadSnapshot expects to be given.
+	return loadSnapshot(ctx, tx, strings.TrimSuffix(scope, "/hold"), paymentID)
 }
 
 func loadSnapshot(ctx context.Context, tx pgx.Tx, scope, paymentID string) (snapshot, error) {

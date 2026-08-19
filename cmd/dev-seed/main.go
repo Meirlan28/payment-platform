@@ -76,6 +76,7 @@ func run(logger *slog.Logger) error {
 		assetCode = flag.String("asset-code", "USDD", "demo asset display code")
 		scale     = flag.Int64("asset-scale", 2, "atomic scale of the demo asset")
 		principal = flag.String("payment-principal", "", "SPIFFE identity that will authorize payments")
+		refunder  = flag.String("refund-principal", "", "SPIFFE identity permitted to debit merchants when refunding")
 		issuer    = flag.String("issuer", "pay-a", "durable ID issuer prefix")
 		wallets   = flag.Int("wallets", 5, "number of demo customer wallets")
 		balance   = flag.String("starting-balance", "100000", "atoms deposited into each wallet")
@@ -185,6 +186,11 @@ func run(logger *slog.Logger) error {
 			if err := accounts.ProvisionMerchantAccount(ctx, provisioning.MerchantAccountRequest{
 				AccountID: accountID, AssetID: *assetID, BookID: bookID,
 				PaymentPrincipalID: *principal,
+				// Empty when no refund identity was named, which grants
+				// nothing: a merchant that cannot yet be refunded is a much
+				// smaller problem than a payment credential that silently
+				// gained the ability to debit one.
+				RefundPrincipalID: *refunder,
 			}); err != nil {
 				return fmt.Errorf("provision merchant %s in %s: %w", merchant.id, bookID, err)
 			}

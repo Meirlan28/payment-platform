@@ -86,9 +86,19 @@ func (s *AccountProvisioningServer) ProvisionMerchantAccount(
 	if err != nil {
 		return nil, s.reject(ctx, err)
 	}
+	// Only when one was named, and only from the allowlist: the same rule the
+	// payment and transfer principals follow.
+	refundPrincipal := ""
+	if selector := request.GetRefundPrincipalSelector(); selector != "" {
+		refundPrincipal, err = s.Allowlist.Resolve(principal, selector)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := s.Accounts.ProvisionMerchantAccount(ctx, MerchantAccountRequest{
 		AccountID: request.GetAccountId(), AssetID: request.GetAssetId(),
 		BookID: request.GetBookId(), PaymentPrincipalID: paymentPrincipal,
+		RefundPrincipalID: refundPrincipal,
 	}); err != nil {
 		return nil, s.reject(ctx, err)
 	}

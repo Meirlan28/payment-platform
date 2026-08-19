@@ -32,6 +32,7 @@ type PaymentCommands interface {
 	Refund(context.Context, payment.RefundRequest) (payment.Receipt, error)
 	Chargeback(context.Context, payment.ChargebackRequest) (payment.Receipt, error)
 	GetForScope(context.Context, string, string) (payment.Receipt, error)
+	GetDetailsForScope(context.Context, string, string) (payment.Details, error)
 }
 
 type PrincipalResolver func(context.Context) (string, error)
@@ -262,11 +263,17 @@ func (s *PaymentServer) GetPayment(ctx context.Context, request *paymentv1.GetPa
 	if request.GetPaymentId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "payment_id is required")
 	}
-	receipt, err := s.Payments.GetForScope(ctx, "principal/"+principal, request.GetPaymentId())
+	details, err := s.Payments.GetDetailsForScope(ctx, "principal/"+principal, request.GetPaymentId())
 	if err != nil {
 		return nil, s.mapError("get_payment", err)
 	}
-	return &paymentv1.GetPaymentResponse{Payment: paymentMessage(receipt)}, nil
+	return &paymentv1.GetPaymentResponse{
+		Payment:               paymentMessage(details.Receipt),
+		CaptureTransactionIds: details.CaptureTransactionIDs,
+		CapturedAtoms:         details.Captured.String(),
+		RefundedAtoms:         details.Refunded.String(),
+		ChargedBackAtoms:      details.ChargedBack.String(),
+	}, nil
 }
 
 func (s *PaymentServer) principal(ctx context.Context) (string, error) {
